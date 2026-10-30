@@ -1,0 +1,92 @@
+[package]
+name = "mnem"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Memory for proactive agents: an OptMem-compatible notebook, a nightly Dream pass, and a nudge heartbeat."
+publish = false
+
+[dependencies]
+
+# Lint policy: rust-anti-slop baseline plus the profiles that fit Mnem.
+# Mnem is a single-threaded CLI with no async, and it parses and writes
+# fixed-width storage records, so the numeric and indexing profile applies.
+# The async profile is left out on purpose.
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+unreachable_pub = "deny"
+unexpected_cfgs = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unused_qualifications = "warn"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+
+# Exceptions must explain themselves.
+allow_attributes_without_reason = "deny"
+
+# No hidden panic, placeholder or debug paths in production code. The CLI's
+# single output function carries a narrow #[expect] for print_stdout.
+dbg_macro = "deny"
+exit = "deny"
+expect_used = "deny"
+panic = "deny"
+print_stderr = "deny"
+print_stdout = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_used = "deny"
+
+# Do not erase errors or must-use values.
+let_underscore_must_use = "deny"
+map_err_ignore = "deny"
+
+# Keep imports explicit.
+enum_glob_use = "deny"
+wildcard_imports = "deny"
+
+# Unsafe code must carry a reviewable contract.
+mem_forget = "deny"
+missing_safety_doc = "deny"
+undocumented_unsafe_blocks = "deny"
+
+# Ownership and API shape.
+clone_on_ref_ptr = "deny"
+fn_params_excessive_bools = "deny"
+needless_collect = "deny"
+rc_mutex = "deny"
+redundant_clone = "deny"
+result_large_err = "deny"
+struct_excessive_bools = "deny"
+unnecessary_box_returns = "deny"
+unnecessary_wraps = "deny"
+too_many_arguments = "deny"
+too_many_lines = "warn"
+type_complexity = "warn"
+
+# Error and control flow: new enum variants must force review.
+fallible_impl_from = "deny"
+match_wild_err_arm = "deny"
+match_wildcard_for_single_variants = "deny"
+wildcard_enum_match_arm = "deny"
+manual_let_else = "warn"
+
+# Numeric and indexing: record offsets, ids and byte lengths are storage
+# math, so conversions are checked and slicing is proven or avoided.
+as_conversions = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+checked_conversions = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+
+# Cargo hygiene.
+negative_feature_names = "deny"
+redundant_feature_names = "deny"
+wildcard_dependencies = "deny"

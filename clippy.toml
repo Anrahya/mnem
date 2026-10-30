@@ -1,0 +1,12 @@
+# Tests may use expect with a specific fixture or setup invariant; raw unwrap
+# stays denied everywhere.
+allow-expect-in-tests = true
+allow-unwrap-in-tests = false
+allow-panic-in-tests = true
+allow-print-in-tests = false
+allow-dbg-in-tests = false
+allow-indexing-slicing-in-tests = false
+
+# Keep unsafe proof comments close to the operation.
+accept-comment-above-attributes = true
+accept-comment-above-statement = true

@@ -1,0 +1,52 @@
+# Mnem
+
+Memory for proactive agents, in Rust. The design is the spec at
+https://claude.ai/artifact/5VHSbkX5WpDaiS3PHd2xJT (draft 3). Read the part
+you are building before writing code; when code and spec disagree, raise it
+instead of silently picking one.
+
+## Checks
+
+Run all of these before calling a change done. They must pass with no warnings:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --all-targets --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
+```
+
+## How to write Rust here
+
+Follow the `rust-anti-slop` skill. Its lint policy is in `Cargo.toml` and
+`clippy.toml`. In particular, production code has no `unwrap`, `expect` or
+`panic`.
+
+On top of that skill, these rules come from Google's Rust style guide:
+
+- Name fallible constructors `try_new`, use the `as_`/`to_`/`into_` method
+  prefixes as std does, and avoid abbreviations.
+- Call free functions through their module (`log::append()`); import types
+  and use them unqualified. One module per `use` line.
+- Write the type on the result of `.parse()`, `.into()` and `.collect()`.
+- Prefer a plain `for` loop to a long iterator chain; avoid `for_each`.
+- Give every `assert!` a message that says why it should hold.
+- Never call `std::panic::catch_unwind`.
+
+## Mnem-specific rules
+
+- **OptMem compatibility.** The notebook (`LOG.txt`, `TREE/<size>`, `config`)
+  must stay byte-compatible with the stock `memo` tool
+  (github.com/VictorTaelin/OptMem). That repo has no license: re-implement its
+  format from its documented behaviour and never copy its code. Test
+  compatibility by running the Python `memo` and Mnem on the same inputs and
+  comparing the files.
+- **UniiChat** (github.com/VictorTaelin/uniichat) is Apache-2.0. Ideas or
+  code taken from it get an attribution comment.
+- **No async.** Mnem is single-threaded. Lock files with `std::fs::File::lock`.
+- **Time is injected.** Code that depends on the clock (heartbeat, `until`,
+  hunch fade) takes the current time as an argument, so tests never sleep.
+- **One output boundary.** Only the CLI's output function prints. It carries
+  a narrow `#[expect(clippy::print_stdout, reason = "...")]`.
+- **Model calls** happen only in the compactor and Dream, and code validates
+  everything they return before it touches disk.
