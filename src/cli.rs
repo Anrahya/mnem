@@ -17,15 +17,20 @@ use std::path::PathBuf;
 
 use regex::RegexBuilder;
 
+use crate::compactor;
+use crate::compactor::Input;
+use crate::compactor::Run;
+use crate::compactor::Stop;
+use crate::compactor::Written;
 use crate::config::ConfigError;
 use crate::config::Knob;
 use crate::cover;
 use crate::day::Day;
 use crate::day::DayError;
+use crate::model::CommandModel;
 use crate::notebook::Notebook;
 use crate::notebook::NotebookError;
 use crate::notebook::PutOutcome;
-use crate::record::Note;
 use crate::span::Span;
 use crate::span::SpanError;
 use crate::text;
@@ -36,10 +41,6 @@ use crate::text::TextError;
 /// `\w{1000}` expand far past the regex crate's default limit, because `\w`
 /// covers all of Unicode.
 const RECALL_REGEX_BYTES: usize = 256 << 20;
-
-/// Blocks of at most this many notes are summarized from the notes
-/// themselves; larger blocks from the summaries of their two halves.
-pub const RAW_MAX: u64 = 16;
 
 /// What a command needs from outside the notebook.
 #[derive(Clone, Debug)]
@@ -52,6 +53,9 @@ pub struct Context {
     pub home: Option<PathBuf>,
     /// The day new notes are dated with.
     pub today: Day,
+    /// The program that writes summaries, if the harness provides one.
+    /// Without it the agent is asked to write them, as in stock OptMem.
+    pub summarizer: Option<CommandModel>,
 }
 
 /// A command's output and exit status.
@@ -63,6 +67,9 @@ pub struct Reply {
     pub stderr: String,
     /// The exit status.
     pub code: u8,
+    /// Whether summaries are due and the summarizer should start in the
+    /// background once the reply is out.
+    pub compact: bool,
 }
 
 impl Reply {
@@ -72,6 +79,7 @@ impl Reply {
             stdout: String::new(),
             stderr: format!("{message}\n"),
             code: 1,
+            compact: false,
         }
     }
 
@@ -80,6 +88,7 @@ impl Reply {
             stdout: joined(lines),
             stderr: String::new(),
             code: 0,
+            compact: false,
         }
     }
 
@@ -90,6 +99,7 @@ impl Reply {
             stdout: joined(lines),
             stderr: String::new(),
             code: 1,
+            compact: false,
         }
     }
 }
@@ -136,6 +146,7 @@ pub fn run(context: &Context, args: &[OsString]) -> Reply {
                 .map_err(Failure::Notebook)
                 .and_then(|notebook| command(context, &notebook, rest)),
             None => Ok(Reply {
+                compact: false,
                 stdout: String::new(),
                 stderr: format!("No such command: {command}\n\n{}\n", usage(context)),
                 code: 1,
@@ -161,6 +172,7 @@ fn command_named(name: &str) -> Option<Command> {
         "forget" => forget,
         "config" => config,
         "import" => import,
+        "compact" => compact,
         _ => return None,
     };
     Some(command)
@@ -178,12 +190,15 @@ fn usage(context: &Context) -> String {
          Writing\n\
          \x20 note \"<line>\"            add a note of one line\n\
          \x20 nap [<lo>-<hi> \"<line>\"] show or write the next summary that is due\n\
-         \x20 forget <lo>-<hi>         discard a summary and every summary built on it\n\n\
+         \x20 forget <lo>-<hi>         discard a summary and every summary built on it\n\
+         \x20 compact                  write every due summary with the summarizer\n\n\
          Setup\n\
          \x20 init                     create the notebook, then print instructions for your agent\n\
          \x20 config [NAME=VALUE ...]  list the notebook's size settings, or set them\n\
          \x20 import <file>            bulk-add old notes, one \"YYYY-MM-DD text\" per line\n\n\
-         Notebook folder: $MEMORY_DIR, or ~/.optmem/memory when that is unset."
+         Notebook folder: $MEMORY_DIR, or ~/.optmem/memory when that is unset.\n\
+         Summarizer: the program named by $MNEM_SUMMARIZER; without one, the agent\n\
+         is asked to write summaries itself."
     )
 }
 
@@ -227,7 +242,7 @@ fn init(context: &Context, args: &[&str]) -> Outcome {
     ));
     out.push(String::new());
     out.push(
-        "Paste this near the top of your agent's instructions (CLAUDE.md or AGENTS.md):".to_owned(),
+        "Add this to your agent's standing instructions (its system prompt, or a file such as SOUL.md):".to_owned(),
     );
     out.push(String::new());
     out.push(setup_block(
@@ -255,6 +270,70 @@ fn setup_block(me: &str, dir: &str, chars: usize) -> String {
          5. Only you write to the notebook. Subagents must not use `{me}`; say so\n\
          \x20  whenever you delegate to one."
     )
+}
+
+/// Who writes the summaries that are due.
+enum Summaries {
+    /// The agent, as in stock OptMem: no summarizer is set.
+    ByAgent,
+    /// The summarizer, in the background.
+    BySummarizer,
+    /// The agent for now, because the summarizer's last run failed; it is
+    /// still started each time, so it takes over again once it works.
+    Failing(String),
+}
+
+impl Summaries {
+    fn of(context: &Context, notebook: &Notebook) -> Self {
+        if context.summarizer.is_none() {
+            return Self::ByAgent;
+        }
+        match compactor::failure(notebook.dir()) {
+            Some(why) => Self::Failing(why),
+            None => Self::BySummarizer,
+        }
+    }
+
+    /// Whether the summarizer should start.
+    fn starts(&self) -> bool {
+        !matches!(self, Self::ByAgent)
+    }
+
+    /// The line that tells the agent why summaries fall to it, if they
+    /// normally would not.
+    fn excuse(&self) -> Option<String> {
+        match self {
+            Self::Failing(why) => Some(format!(
+                "The summarizer is failing ({why}), so summaries fall to you until it works again."
+            )),
+            Self::ByAgent | Self::BySummarizer => None,
+        }
+    }
+}
+
+/// The reply `lines`, followed by the prompt for the next summary due among
+/// the first `notes` notes when the agent is the one to write it. With a
+/// summarizer the reply starts it instead.
+fn with_next_summary(
+    context: &Context,
+    notebook: &Notebook,
+    mut lines: Vec<String>,
+    notes: u64,
+) -> Outcome {
+    let summaries = Summaries::of(context, notebook);
+    let due = notebook.pending_count(notes)? > 0;
+    if !matches!(summaries, Summaries::BySummarizer)
+        && let Some(prompt) = next_nap(context, notebook, notes)?
+    {
+        lines.push(String::new());
+        if let Some(excuse) = summaries.excuse() {
+            lines.push(excuse);
+        }
+        lines.push(prompt);
+    }
+    let mut reply = Reply::done(&lines);
+    reply.compact = due && summaries.starts();
+    Ok(reply)
 }
 
 fn wake(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
@@ -286,7 +365,13 @@ fn wake(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
     }
     let lines = match document(context, notebook, snapshot)? {
         Document::Lines(lines) => lines,
-        Document::Refused(refusal) => return Ok(Reply::refused(&refusal)),
+        Document::Refused(refusal) => {
+            // The agent is asked as in stock OptMem; a summarizer, if there
+            // is one, starts on the same work, and whichever writes first wins.
+            let mut reply = Reply::refused(&refusal);
+            reply.compact = Summaries::of(context, notebook).starts();
+            return Ok(reply);
+        }
     };
     let config = notebook.config();
     let parts = paginate(lines, config.part_lines(), config.part_chars());
@@ -318,10 +403,7 @@ fn wake(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
         ));
     } else {
         out.push("You are awake.".to_owned());
-        if let Some(prompt) = next_nap(context, notebook, snapshot)? {
-            out.push(String::new());
-            out.push(prompt);
-        }
+        return with_next_summary(context, notebook, out, snapshot);
     }
     Ok(Reply::done(&out))
 }
@@ -339,7 +421,7 @@ fn document(context: &Context, notebook: &Notebook, notes: u64) -> Result<Docume
     let mut lines = Vec::new();
     for span in spans {
         if span.is_note() {
-            lines.push(note_line(&notebook.note(span.lo())?));
+            lines.push(notebook.note(span.lo())?.line());
             continue;
         }
         let summary = match notebook.summary(span)? {
@@ -407,13 +489,8 @@ fn note(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
     let text =
         Text::try_new(raw, limit).map_err(|error| Failure::Said(text_problem(&error, "note")))?;
     let id = notebook.append(&[(context.today.clone(), text)])?;
-    let mut out = vec![format!("Noted as #{id}.")];
     let notes = id.checked_add(1).ok_or(NotebookError::Overflow)?;
-    if let Some(prompt) = next_nap(context, notebook, notes)? {
-        out.push(String::new());
-        out.push(prompt);
-    }
-    Ok(Reply::done(&out))
+    with_next_summary(context, notebook, vec![format!("Noted as #{id}.")], notes)
 }
 
 fn nap(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
@@ -484,17 +561,9 @@ fn nap_prompt(
             .to_owned(),
         String::new(),
     ];
-    if block.size() <= RAW_MAX {
-        for note in notebook.notes(block.lo(), block.hi())? {
-            lines.push(format!("  {}", note_line(&note)));
-        }
-    } else if let Some((first, second)) = block.halves() {
-        for half in [first, second] {
-            let summary = notebook
-                .summary(half)?
-                .ok_or_else(|| blank(context, half))?;
-            lines.push(format!("  #{half} {summary}"));
-        }
+    let input = Input::read(notebook, block)?.map_err(|half| blank(context, half))?;
+    for line in input.lines {
+        lines.push(format!("  {line}"));
     }
     lines.push(String::new());
     if left > 0 {
@@ -527,7 +596,7 @@ fn recall(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
     let mut size: usize = 0;
     let mut hits: u64 = 0;
     for note in notebook.scan()? {
-        let line = note_line(&note?);
+        let line = note?.line();
         if !regex.is_match(&line) {
             continue;
         }
@@ -583,7 +652,7 @@ fn zoom(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
                 continue;
             }
             if half.is_note() {
-                out.push(note_line(&notebook.note(half.lo())?));
+                out.push(notebook.note(half.lo())?.line());
             } else {
                 let summary = notebook
                     .summary(half)?
@@ -604,12 +673,24 @@ fn forget(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
     let Some(first) = gone.first() else {
         return Err(Failure::Said(format!("{id} has no summary to forget.")));
     };
-    let dropped = u64::try_from(gone.len()).unwrap_or(u64::MAX);
-    Ok(Reply::done(&[format!(
-        "Dropped {}, starting at {first}; they are due again. Rewrite them with: {} nap",
-        count(dropped, "summary", "summaries"),
-        context.me
-    )]))
+    let dropped = count(
+        u64::try_from(gone.len()).unwrap_or(u64::MAX),
+        "summary",
+        "summaries",
+    );
+    let summaries = Summaries::of(context, notebook);
+    let line = match summaries {
+        Summaries::BySummarizer => {
+            format!("Dropped {dropped}, starting at {first}; the summarizer is rewriting them.")
+        }
+        Summaries::ByAgent | Summaries::Failing(_) => format!(
+            "Dropped {dropped}, starting at {first}; they are due again. Rewrite them with: {} nap",
+            context.me
+        ),
+    };
+    let mut reply = Reply::done(&[line]);
+    reply.compact = summaries.starts();
+    Ok(reply)
 }
 
 fn config(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
@@ -716,19 +797,80 @@ fn import(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
         first.saturating_add(added).saturating_sub(1)
     )];
     let due = notebook.pending_count(notebook.len()?)?;
+    let summaries = Summaries::of(context, notebook);
     if due > 0 {
-        out.push(format!(
-            "{} now due. Write them with: {} nap",
-            count(due, "summary is", "summaries are"),
-            context.me
-        ));
+        let due = count(due, "summary is", "summaries are");
+        out.push(match summaries {
+            Summaries::BySummarizer => format!("{due} now due; the summarizer is writing them."),
+            Summaries::ByAgent | Summaries::Failing(_) => {
+                format!("{due} now due. Write them with: {} nap", context.me)
+            }
+        });
     }
-    Ok(Reply::done(&out))
+    let mut reply = Reply::done(&out);
+    reply.compact = due > 0 && summaries.starts();
+    Ok(reply)
 }
 
-/// The line that shows a note, exactly as `memo` prints it.
-fn note_line(note: &Note) -> String {
-    format!("#{} {} {}", note.id, note.day, note.text)
+fn compact(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
+    if !args.is_empty() {
+        return Err(usage_error(context, "compact"));
+    }
+    let Some(summarizer) = &context.summarizer else {
+        return Err(Failure::Said(format!(
+            "No summarizer is set. Name the program in MNEM_SUMMARIZER, or write the summaries with: {} nap",
+            context.me
+        )));
+    };
+    let mut model = summarizer.clone();
+    let report = match compactor::run(notebook, &mut model)? {
+        Run::Busy => {
+            return Ok(Reply::done(&[
+                "A summarizer is already running on this notebook.".to_owned(),
+            ]));
+        }
+        Run::Ran(report) => report,
+    };
+    let mut out = Vec::new();
+    for (block, how) in &report.written {
+        out.push(match how {
+            Written::ByModel => format!("Wrote {block}."),
+            Written::CutReply => format!(
+                "Wrote {block} from the model's shortest line, cut to fit: every try was too long."
+            ),
+            Written::CutInput => {
+                format!("Wrote {block} from its input, cut to fit: the model declined.")
+            }
+        });
+    }
+    let failed = match &report.stopped {
+        None => false,
+        Some(Stop::Unavailable(why)) => {
+            out.push(format!("Stopped: the summarizer could not run: {why}"));
+            true
+        }
+        Some(Stop::BlankHalf { block, half }) => {
+            out.push(format!(
+                "Stopped: {block} is built from #{half}, whose summary record is empty. Drop it with: {} forget {half}",
+                context.me
+            ));
+            true
+        }
+    };
+    let due = notebook.pending_count(notebook.len()?)?;
+    if due == 0 {
+        out.push("Nothing left to summarize.".to_owned());
+    } else {
+        out.push(format!(
+            "{} still due.",
+            count(due, "summary is", "summaries are")
+        ));
+    }
+    Ok(if failed {
+        Reply::refused(&out)
+    } else {
+        Reply::done(&out)
+    })
 }
 
 fn parse_block(raw: &str) -> Result<Span, Failure> {
@@ -845,13 +987,16 @@ mod tests {
     use std::ffi::OsString;
     use std::fs;
     use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
+    use std::time::Duration;
 
     use super::Context;
     use super::Reply;
     use crate::cli;
     use crate::config::Config;
     use crate::day::Day;
+    use crate::model::CommandModel;
     use crate::testing::Scratch;
 
     fn context(scratch: &Scratch) -> Context {
@@ -860,6 +1005,7 @@ mod tests {
             me: "mnem".to_owned(),
             home: None,
             today: Day::try_new("2026-10-31").expect("a real date"),
+            summarizer: None,
         }
     }
 
@@ -1312,6 +1458,141 @@ mod tests {
             1,
             "arguments must be UTF-8"
         );
+    }
+
+    /// A context whose summarizer is a shell script answering `line`.
+    fn with_summarizer(scratch: &Scratch, line: &str) -> Context {
+        let context = notebook_with(scratch, 0);
+        let program = scratch.path.join("summarizer.sh");
+        fs::write(
+            &program,
+            format!("#!/bin/sh\ncat > /dev/null\necho '{line}'\n"),
+        )
+        .expect("script");
+        let mut permissions = fs::metadata(&program).expect("script").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&program, permissions).expect("executable");
+        Context {
+            summarizer: Some(CommandModel::new(program, Duration::from_secs(30))),
+            ..context
+        }
+    }
+
+    #[test]
+    fn with_a_summarizer_the_agent_is_not_asked_for_summaries() {
+        let scratch = Scratch::new();
+        let context = with_summarizer(&scratch, "a pair");
+        let first = run(&context, &["note", "one"]);
+        assert_eq!(first.stdout, "Noted as #0.\n", "nothing due yet");
+        assert!(!first.compact, "so no summarizer");
+        let second = run(&context, &["note", "two"]);
+        assert_eq!(second.stdout, "Noted as #1.\n", "no prompt for the agent");
+        assert!(second.compact, "the summarizer starts instead");
+        let woken = run(&context, &["wake"]);
+        assert!(
+            woken.stdout.ends_with("You are awake.\n"),
+            "no prompt after wake"
+        );
+        assert!(woken.compact, "wake starts it too while summaries are due");
+        assert_eq!(
+            ok(&context, &["compact"]),
+            "Wrote 0-1.\nNothing left to summarize.\n",
+            "compact writes them"
+        );
+        assert!(!run(&context, &["wake"]).compact, "nothing due any more");
+        assert_eq!(
+            ok(&context, &["zoom", "0-1"]),
+            "#0 2026-10-31 one\n#1 2026-10-31 two\n",
+            "notes kept"
+        );
+        assert!(
+            ok(&context, &["wake"]).contains("#0 2026-10-31 one"),
+            "wake shows notes"
+        );
+    }
+
+    #[test]
+    fn compact_reports_an_unreachable_summarizer() {
+        let scratch = Scratch::new();
+        let context = with_summarizer(&scratch, "unused");
+        ok(&context, &["note", "one"]);
+        ok(&context, &["note", "two"]);
+        let broken = Context {
+            summarizer: Some(CommandModel::new(
+                scratch.path.join("absent"),
+                Duration::from_secs(1),
+            )),
+            ..context.clone()
+        };
+        let reply = run(&broken, &["compact"]);
+        assert_eq!(reply.code, 1, "a failed run");
+        assert!(
+            reply
+                .stdout
+                .contains("Stopped: the summarizer could not run"),
+            "{}",
+            reply.stdout
+        );
+        assert!(
+            reply.stdout.ends_with("1 summary is still due.\n"),
+            "{}",
+            reply.stdout
+        );
+        let noted = run(&broken, &["note", "three"]);
+        assert!(
+            noted.stdout.contains("The summarizer is failing (")
+                && noted.stdout.contains("Run: mnem nap 0-1"),
+            "while it fails, the agent is told why and asked instead: {}",
+            noted.stdout
+        );
+        assert!(noted.compact, "and the summarizer is still tried");
+        assert!(
+            run(&broken, &["wake"])
+                .stdout
+                .contains("The summarizer is failing ("),
+            "wake says so too"
+        );
+        assert_eq!(
+            ok(&context, &["compact"]),
+            "Wrote 0-1.\nNothing left to summarize.\n",
+            "a working summarizer catches up"
+        );
+        assert_eq!(
+            run(&context, &["note", "four"]).stdout,
+            "Noted as #3.\n",
+            "and the agent is left alone again"
+        );
+        let without = Context {
+            summarizer: None,
+            ..context
+        };
+        assert!(
+            fails(&without, &["compact"]).contains("No summarizer is set"),
+            "none set"
+        );
+    }
+
+    #[test]
+    fn import_and_forget_hand_their_work_to_the_summarizer() {
+        let scratch = Scratch::new();
+        let context = with_summarizer(&scratch, "a summary");
+        let file = scratch.path.join("import.txt");
+        fs::write(&file, "2026-01-01 one\n2026-01-01 two\n").expect("write");
+        let imported = run(&context, &["import", file.to_str().expect("UTF-8 path")]);
+        assert_eq!(
+            imported.stdout,
+            "Added 2 notes as #0 to #1.\n1 summary is now due; the summarizer is writing them.\n",
+            "import leaves the summary to the summarizer"
+        );
+        assert!(imported.compact, "and starts it");
+        ok(&context, &["compact"]);
+        let forgot = run(&context, &["forget", "0-1"]);
+        assert_eq!(
+            forgot.stdout,
+            "Dropped 1 summary, starting at 0-1; the summarizer is rewriting them.\n",
+            "forget too"
+        );
+        assert!(forgot.compact, "and starts it");
     }
 
     #[test]

@@ -1,28 +1,42 @@
 //! The `mnem` binary: reads the environment and the clock, runs one command,
-//! and writes its reply.
+//! writes its reply, and starts the summarizer when summaries are due.
 
 use std::env;
 use std::ffi::OsString;
 use std::io;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::process::ExitCode;
+use std::process::Stdio;
+use std::time::Duration;
 
 use jiff::Zoned;
 use mnem::cli;
 use mnem::cli::Context;
 use mnem::cli::Reply;
 use mnem::day::Day;
+use mnem::model::CommandModel;
+
+/// How long one summary call may take before the summarizer gives up on it.
+const SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn main() -> ExitCode {
     let mut args = env::args_os();
     let program = args.next().map(PathBuf::from);
     let rest: Vec<OsString> = args.collect();
-    let reply = match context(program) {
-        Ok(context) => cli::run(&context, &rest),
-        Err(message) => Reply::failed(&message),
+    let context = match context(program) {
+        Ok(context) => context,
+        Err(message) => return emit(&Reply::failed(&message)),
     };
-    emit(&reply)
+    let reply = cli::run(&context, &rest);
+    let code = emit(&reply);
+    if reply.compact {
+        start_summarizer(&context);
+    }
+    code
 }
 
 fn context(program: Option<PathBuf>) -> Result<Context, String> {
@@ -31,11 +45,15 @@ fn context(program: Option<PathBuf>) -> Result<Context, String> {
     let me = cli::invoked_as(program.as_deref(), cwd.as_deref(), home.as_deref());
     let dir = cli::memory_dir(env::var_os("MEMORY_DIR"), home.as_deref(), cwd.as_deref())
         .ok_or("Cannot tell where the notebook is: set MEMORY_DIR, or HOME.")?;
+    let summarizer = env::var_os("MNEM_SUMMARIZER")
+        .filter(|program| !program.is_empty())
+        .map(|program| CommandModel::new(PathBuf::from(program), SUMMARY_TIMEOUT));
     Ok(Context {
         dir,
         me,
         home,
         today: today()?,
+        summarizer,
     })
 }
 
@@ -45,6 +63,28 @@ fn today() -> Result<Day, String> {
     let date = Zoned::now().date();
     Day::try_new(&date.to_string())
         .map_err(|error| format!("Today's date, {date}, cannot date a note: {error}."))
+}
+
+/// Starts `mnem compact` on the same notebook and does not wait for it. The
+/// agent's command returns at once; the summaries land when the model has
+/// written them. If the start fails, nothing is lost: the summaries stay due,
+/// and `wake` asks the agent for any it needs.
+fn start_summarizer(context: &Context) {
+    let Ok(program) = env::current_exe() else {
+        return;
+    };
+    let mut command = Command::new(program);
+    command
+        .arg("compact")
+        .env("MEMORY_DIR", &context.dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // Its own process group, so a terminal closing behind the agent's
+    // command does not stop it.
+    #[cfg(unix)]
+    command.process_group(0);
+    drop(command.spawn());
 }
 
 /// The only place Mnem writes to the terminal. It writes through `io::Write`

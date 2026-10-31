@@ -1129,3 +1129,42 @@ fn notes_are_dated_in_the_local_time_zone() {
         "the time zone was honoured: {days:?}"
     );
 }
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn memo_reads_what_the_summarizer_writes() {
+    let scratch = harness::scratch("summarizer");
+    let dir = scratch.path().join("nb");
+    py_build(&dir, 150, 0);
+    let summarizer = scratch.path().join("summarizer.sh");
+    fs::write(
+        &summarizer,
+        "#!/bin/sh\nsed -n '/^<input>$/{n;p;q;}' | cut -c1-200 | sed 's/^/from /'\n",
+    )
+    .expect("write script");
+    let status = std::process::Command::new("chmod")
+        .arg("755")
+        .arg(&summarizer)
+        .status()
+        .expect("chmod runs");
+    assert!(status.success(), "the script is executable");
+    let compact = harness::mnem_command(&dir)
+        .env("MNEM_SUMMARIZER", &summarizer)
+        .arg("compact")
+        .output()
+        .expect("mnem runs");
+    assert!(compact.status.success(), "mnem compact succeeds");
+    let wake = harness::run_memo(&dir, &["wake"]);
+    assert!(wake.status.success(), "memo wakes on the summarizer's tree");
+    let output = String::from_utf8_lossy(&wake.stdout).into_owned();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "#0-3 from #0 2026-10-01 py note 0 \u{e9}"),
+        "memo shows them: {output}"
+    );
+    assert!(
+        output.contains("You are awake."),
+        "with nothing left to write"
+    );
+}

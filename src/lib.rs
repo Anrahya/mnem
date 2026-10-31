@@ -5,9 +5,11 @@
 //! The design is in the spec linked from README.md.
 
 pub mod cli;
+pub mod compactor;
 pub mod config;
 pub mod cover;
 pub mod day;
+pub mod model;
 pub mod notebook;
 pub mod record;
 pub mod span;

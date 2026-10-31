@@ -49,6 +49,28 @@ impl Text {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// `raw` made to fit as one line: line breaks become spaces, the ends
+    /// are trimmed, and the text is cut at a character boundary to at most
+    /// `limit` bytes (and never more than [`TEXT_MAX`]). Text that leaves
+    /// nothing becomes `-`, so `limit` must be at least 1.
+    pub(crate) fn cut(raw: &str, limit: usize) -> Self {
+        let limit = limit.min(TEXT_MAX);
+        let flat = raw.replace(['\n', '\r'], " ");
+        let mut kept = String::new();
+        for c in flat.trim_matches(is_python_space).chars() {
+            if kept.len().saturating_add(c.len_utf8()) > limit {
+                break;
+            }
+            kept.push(c);
+        }
+        let kept = kept.trim_end_matches(is_python_space);
+        if kept.is_empty() {
+            debug_assert!(limit >= 1, "config allows no ENTRY_CHARS below 1");
+            return Self("-".to_owned());
+        }
+        Self(kept.to_owned())
+    }
 }
 
 impl fmt::Display for TextError {
@@ -147,6 +169,31 @@ mod tests {
                 bytes: 281,
                 limit: 280
             })
+        );
+    }
+
+    #[test]
+    fn cut_makes_one_line_that_fits() {
+        assert_eq!(
+            Text::cut(" one\ntwo\r\nthree ", 280).as_str(),
+            "one two  three",
+            "breaks become spaces"
+        );
+        assert_eq!(
+            Text::cut("ab\u{1F680}", 5).as_str(),
+            "ab",
+            "never splits a character"
+        );
+        assert_eq!(
+            Text::cut("abc   def", 5).as_str(),
+            "abc",
+            "no trailing space"
+        );
+        assert_eq!(Text::cut("\u{1F680}", 2).as_str(), "-", "nothing fits");
+        assert_eq!(
+            Text::cut(&"z".repeat(400), 1000).as_str().len(),
+            TEXT_MAX,
+            "never past TEXT_MAX"
         );
     }
 }

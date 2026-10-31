@@ -56,12 +56,14 @@ On top of that skill, these rules come from Google's Rust style guide:
   compatibility by running the Python `memo` and Mnem on the same inputs and
   comparing the files.
 - **UniiChat** (github.com/VictorTaelin/uniichat) is Apache-2.0. Ideas or
-  code taken from it get an attribution comment.
+  code taken from it get an attribution comment and a line in `NOTICE`.
 - **No async.** Mnem is single-threaded. Lock files with `std::fs::File::lock`.
 - **Time is injected.** Code that depends on the clock (heartbeat, `until`,
   hunch fade) takes the current time as an argument, so tests never sleep.
 - **One output boundary.** Commands return their output as a `Reply`; only
   `emit` in `src/main.rs` writes to the terminal. It uses `io::Write`, not
   `print!`, so a closed pipe is a failed exit rather than a panic.
-- **Model calls** happen only in the compactor and Dream, and code validates
-  everything they return before it touches disk.
+- **Model calls** go through the `Model` seam in `src/model.rs`: the harness
+  names a program (`MNEM_SUMMARIZER`; prompt on stdin, reply on stdout, exit
+  3 to decline), and Mnem has no model of its own or any provider's API. They happen only in the compactor and Dream, and code
+  validates everything they return before it touches disk.

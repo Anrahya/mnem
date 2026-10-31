@@ -50,6 +50,14 @@ pub struct Note {
     pub text: String,
 }
 
+impl Note {
+    /// The note as `wake`, `recall` and the prompts show it, exactly as
+    /// `memo` prints it: `#<id> <day> <text>`.
+    pub fn line(&self) -> String {
+        format!("#{} {} {}", self.id, self.day, self.text)
+    }
+}
+
 /// Why a record could not be decoded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RecordError {

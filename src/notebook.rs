@@ -36,6 +36,10 @@ use crate::record::TREE_REC;
 use crate::span::Span;
 use crate::text::Text;
 
+/// Blocks of at most this many notes are summarized from the notes
+/// themselves; larger blocks from the summaries of their two halves.
+pub const RAW_MAX: u64 = 16;
+
 /// An open notebook directory.
 #[derive(Debug)]
 pub struct Notebook {
@@ -232,6 +236,19 @@ impl Notebook {
     /// Appends the summary of `block`. The block must lie inside the log and
     /// be the next one its level file expects; blocks are built in order.
     pub fn put_summary(&self, block: Span, text: &Text) -> Result<PutOutcome, NotebookError> {
+        self.put_summary_over(block, text, &[])
+    }
+
+    /// Like [`Notebook::put_summary`], but only while each block in
+    /// `sources` still has the summary given with it. A summary written from
+    /// summaries that were forgotten or rebuilt while it was being written
+    /// would outlive them, so it is refused as [`PutOutcome::NotNext`].
+    pub fn put_summary_over(
+        &self,
+        block: Span,
+        text: &Text,
+        sources: &[(Span, String)],
+    ) -> Result<PutOutcome, NotebookError> {
         let Some(offset) = block.tree_offset() else {
             return Err(NotebookError::NotABlock { note: block });
         };
@@ -244,6 +261,11 @@ impl Notebook {
         repair(&path, TREE_REC)?;
         if records_in(&path, TREE_REC)? != offset / TREE_REC {
             return Ok(PutOutcome::NotNext);
+        }
+        for (source, expected) in sources {
+            if self.summary(*source)?.as_ref() != Some(expected) {
+                return Ok(PutOutcome::NotNext);
+            }
         }
         append_synced(&self.dir.join("TREE"), &path, &record::encode_summary(text))?;
         Ok(PutOutcome::Saved)
