@@ -1149,7 +1149,7 @@ fn memo_reads_what_the_summarizer_writes() {
         .expect("chmod runs");
     assert!(status.success(), "the script is executable");
     let compact = harness::mnem_command(&dir)
-        .env("MNEM_SUMMARIZER", &summarizer)
+        .env("MNEM_MODEL", &summarizer)
         .arg("compact")
         .output()
         .expect("mnem runs");

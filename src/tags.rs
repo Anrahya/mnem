@@ -172,18 +172,19 @@ fn reminder(value: &str) -> Option<Reminder> {
     let at = date_time(at)?;
     let until = match until {
         None => None,
-        Some(until) => {
-            let until = match clock(until) {
-                Some(time) => DateTime::from_parts(at.date(), time),
-                None => date_time(until)?,
-            };
-            if until <= at {
-                return None;
-            }
-            Some(until)
-        }
+        Some(raw) => Some(until_after(at, raw)?),
     };
     Some(Reminder { at, until })
+}
+
+/// The end of something due at `at`, written `HH:MM` (the same day) or
+/// `YYYY-MM-DDTHH:MM`; `None` unless it is a time later than `at`.
+pub fn until_after(at: DateTime, raw: &str) -> Option<DateTime> {
+    let until = match clock(raw) {
+        Some(time) => DateTime::from_parts(at.date(), time),
+        None => date_time(raw)?,
+    };
+    (until > at).then_some(until)
 }
 
 /// A local time written `YYYY-MM-DDTHH:MM`.

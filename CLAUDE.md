@@ -64,6 +64,6 @@ On top of that skill, these rules come from Google's Rust style guide:
   `emit` in `src/main.rs` writes to the terminal. It uses `io::Write`, not
   `print!`, so a closed pipe is a failed exit rather than a panic.
 - **Model calls** go through the `Model` seam in `src/model.rs`: the harness
-  names a program (`MNEM_SUMMARIZER`; prompt on stdin, reply on stdout, exit
+  names a program (`MNEM_MODEL`; prompt on stdin, reply on stdout, exit
   3 to decline), and Mnem has no model of its own or any provider's API. They happen only in the compactor and Dream, and code
   validates everything they return before it touches disk.

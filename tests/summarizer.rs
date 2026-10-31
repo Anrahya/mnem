@@ -51,7 +51,7 @@ mod harness {
         let output = Command::new(env!("CARGO_BIN_EXE_mnem"))
             .args(args)
             .env("MEMORY_DIR", dir)
-            .env("MNEM_SUMMARIZER", summarizer)
+            .env("MNEM_MODEL", summarizer)
             .output()
             .expect("mnem runs");
         assert!(

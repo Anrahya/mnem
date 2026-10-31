@@ -14,14 +14,16 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use jiff::Zoned;
+use jiff::civil::Date;
 use mnem::cli;
 use mnem::cli::Context;
 use mnem::cli::Reply;
 use mnem::day::Day;
 use mnem::model::CommandModel;
 
-/// How long one summary call may take before the summarizer gives up on it.
-const SUMMARY_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long one model call may take before Mnem gives up on it. Dream's
+/// call is the long one.
+const MODEL_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn main() -> ExitCode {
     let mut args = env::args_os();
@@ -45,22 +47,24 @@ fn context(program: Option<PathBuf>) -> Result<Context, String> {
     let me = cli::invoked_as(program.as_deref(), cwd.as_deref(), home.as_deref());
     let dir = cli::memory_dir(env::var_os("MEMORY_DIR"), home.as_deref(), cwd.as_deref())
         .ok_or("Cannot tell where the notebook is: set MEMORY_DIR, or HOME.")?;
-    let summarizer = env::var_os("MNEM_SUMMARIZER")
+    let model = env::var_os("MNEM_MODEL")
         .filter(|program| !program.is_empty())
-        .map(|program| CommandModel::new(PathBuf::from(program), SUMMARY_TIMEOUT));
+        .map(|program| CommandModel::new(PathBuf::from(program), MODEL_TIMEOUT));
+    // Read the clock once, so the day and the time always agree.
+    let now = Zoned::now().datetime();
     Ok(Context {
         dir,
         me,
         home,
-        today: today()?,
-        summarizer,
+        today: today(now.date())?,
+        now,
+        model,
     })
 }
 
 /// Today in the local time zone: the date `memo` would give a note written
 /// now. Without a known time zone this falls back to UTC.
-fn today() -> Result<Day, String> {
-    let date = Zoned::now().date();
+fn today(date: Date) -> Result<Day, String> {
     Day::try_new(&date.to_string())
         .map_err(|error| format!("Today's date, {date}, cannot date a note: {error}."))
 }

@@ -3,8 +3,8 @@
 //! Mnem has no model of its own: the agent's harness answers. The harness
 //! names a program; Mnem runs it with the prompt on standard input and reads
 //! the reply from standard output. The program learns what the call is for
-//! from `MNEM_JOB` and `MNEM_EFFORT`, so it can pick a cheap, fast setting
-//! for summaries. It does not get `MEMORY_DIR` or `MNEM_SUMMARIZER`, so a
+//! from `MNEM_JOB` (`summary` or `dream`) and `MNEM_EFFORT`, so it can pick
+//! a cheap, fast setting for summaries and a stronger one for Dream. It does not get `MEMORY_DIR` or `MNEM_MODEL`, so a
 //! program that is itself an agent cannot write to the notebook.
 //!
 //! The program's exit tells Mnem how the call went:
@@ -25,8 +25,12 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
 use std::io::Read;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -63,6 +67,8 @@ const BUSY_TRIES: u32 = 5;
 pub enum Job {
     /// One summary line for a block of the notebook: small and mechanical.
     Summary,
+    /// A new MIND.md from what the notebook learned: the hard one.
+    Dream,
 }
 
 impl Job {
@@ -70,6 +76,7 @@ impl Job {
     pub fn name(self) -> &'static str {
         match self {
             Self::Summary => "summary",
+            Self::Dream => "dream",
         }
     }
 
@@ -77,6 +84,7 @@ impl Job {
     pub fn effort(self) -> &'static str {
         match self {
             Self::Summary => "low",
+            Self::Dream => "high",
         }
     }
 }
@@ -127,10 +135,10 @@ impl CommandModel {
                 .env("MNEM_JOB", job.name())
                 .env("MNEM_EFFORT", job.effort())
                 .env_remove("MEMORY_DIR")
-                .env_remove("MNEM_SUMMARIZER")
+                .env_remove("MNEM_MODEL")
                 .stdin(Stdio::from(File::open(&exchange.input)?))
-                .stdout(Stdio::from(File::create(&exchange.output)?))
-                .stderr(Stdio::from(File::create(&exchange.errors)?));
+                .stdout(Stdio::from(rewrite(&exchange.output)?))
+                .stderr(Stdio::from(rewrite(&exchange.errors)?));
             #[cfg(unix)]
             command.process_group(0);
             match command.spawn() {
@@ -204,9 +212,27 @@ impl Exchange {
             output: dir.join(format!("{stem}.reply")),
             errors: dir.join(format!("{stem}.errors")),
         };
-        fs::write(&exchange.input, prompt)?;
+        // Each file is new, so a link planted at its name is refused, and
+        // only this user can read the notebook material in it.
+        private(&exchange.input)?.write_all(prompt.as_bytes())?;
+        private(&exchange.output)?;
+        private(&exchange.errors)?;
         Ok(exchange)
     }
+}
+
+/// Creates `path`, which must not exist, readable only by this user.
+fn private(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
+/// Opens a file [`private`] made, emptied for another try.
+fn rewrite(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).truncate(true).open(path)
 }
 
 impl Drop for Exchange {
@@ -305,7 +331,7 @@ mod tests {
         let scratch = Scratch::new();
         let program = script(
             &scratch,
-            r#"read -r first; echo "$MNEM_JOB $MNEM_EFFORT ${MEMORY_DIR:-no-dir} ${MNEM_SUMMARIZER:-none}: $first""#,
+            r#"read -r first; echo "$MNEM_JOB $MNEM_EFFORT ${MEMORY_DIR:-no-dir} ${MNEM_MODEL:-none}: $first""#,
         );
         assert_eq!(
             ask(program, PATIENT, "hello\nmore"),
