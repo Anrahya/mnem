@@ -16,6 +16,13 @@ cargo test --all-targets --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 ```
 
+Any change to the notebook format also runs the OptMem compatibility tests,
+which need a checkout of OptMem and `python3`:
+
+```bash
+OPTMEM_MEMO=/path/to/OptMem/memo cargo test --test optmem_compat -- --ignored
+```
+
 ## How to write Rust here
 
 Follow the `rust-anti-slop` skill. Its lint policy is in `Cargo.toml` and
