@@ -49,8 +49,8 @@ On top of that skill, these rules come from Google's Rust style guide:
 
 ## Mnem-specific rules
 
-- **OptMem compatibility.** The notebook (`LOG.txt`, `TREE/<size>`, `config`)
-  must stay byte-compatible with the stock `memo` tool
+- **OptMem compatibility.** `LOG.txt` and `TREE/<size>` must stay
+  byte-compatible, and `config` readable both ways, with the stock `memo` tool
   (github.com/VictorTaelin/OptMem). That repo has no license: re-implement its
   format from its documented behaviour and never copy its code. Test
   compatibility by running the Python `memo` and Mnem on the same inputs and
@@ -60,7 +60,8 @@ On top of that skill, these rules come from Google's Rust style guide:
 - **No async.** Mnem is single-threaded. Lock files with `std::fs::File::lock`.
 - **Time is injected.** Code that depends on the clock (heartbeat, `until`,
   hunch fade) takes the current time as an argument, so tests never sleep.
-- **One output boundary.** Only the CLI's output function prints. It carries
-  a narrow `#[expect(clippy::print_stdout, reason = "...")]`.
+- **One output boundary.** Commands return their output as a `Reply`; only
+  `emit` in `src/main.rs` writes to the terminal. It uses `io::Write`, not
+  `print!`, so a closed pipe is a failed exit rather than a panic.
 - **Model calls** happen only in the compactor and Dream, and code validates
   everything they return before it touches disk.

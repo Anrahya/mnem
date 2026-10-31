@@ -7,6 +7,8 @@ description = "Memory for proactive agents: an OptMem-compatible notebook, a nig
 publish = false
 
 [dependencies]
+jiff = { version = "0.2.35", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+regex = "1.12.3"
 
 # Keep build output small: backtraces still show file and line, but the full
 # debug info, the bulk of target/, is not written.

@@ -546,14 +546,10 @@ impl Error for NotebookError {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
     use std::fs;
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::path::Path;
-    use std::path::PathBuf;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
     use std::thread;
 
     use super::Notebook;
@@ -561,33 +557,9 @@ mod tests {
     use super::PutOutcome;
     use crate::day::Day;
     use crate::span::Span;
+    use crate::testing::Scratch;
     use crate::text::TEXT_MAX;
     use crate::text::Text;
-
-    /// A temporary notebook directory, removed when dropped, even when the
-    /// test fails.
-    struct Scratch {
-        path: PathBuf,
-    }
-
-    impl Scratch {
-        fn new() -> Self {
-            static NEXT: AtomicUsize = AtomicUsize::new(0);
-            let n = NEXT.fetch_add(1, Ordering::Relaxed);
-            let path = env::temp_dir().join(format!("mnem-unit-{}-{n}", std::process::id()));
-            if path.exists() {
-                fs::remove_dir_all(&path).expect("stale scratch folder is removable");
-            }
-            Self { path }
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            // Drop cannot report an error; at worst one temp folder is left.
-            drop(fs::remove_dir_all(&self.path));
-        }
-    }
 
     fn day() -> Day {
         Day::try_new("2026-10-31").expect("a real date")

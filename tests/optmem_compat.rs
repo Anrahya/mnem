@@ -85,14 +85,50 @@ mod harness {
         String::from_utf8(output.stdout).expect("python prints UTF-8")
     }
 
+    /// The command that runs `memo` against the memory in `dir`.
+    pub(crate) fn memo_command(dir: &Path) -> Command {
+        let mut command = Command::new("python3");
+        command.arg(memo_path()).env("MEMORY_DIR", dir);
+        command
+    }
+
     /// Runs `memo <args>` against the memory in `dir`.
     pub(crate) fn run_memo(dir: &Path, args: &[&str]) -> Output {
-        Command::new("python3")
-            .arg(memo_path())
-            .args(args)
-            .env("MEMORY_DIR", dir)
-            .output()
-            .expect("memo runs")
+        memo_command(dir).args(args).output().expect("memo runs")
+    }
+    /// Runs `mnem <args>` against the notebook in `dir`.
+    pub(crate) fn run_mnem(dir: &Path, args: &[&str]) -> Output {
+        mnem_command(dir).args(args).output().expect("mnem runs")
+    }
+
+    /// The command that runs `mnem` against the notebook in `dir`.
+    pub(crate) fn mnem_command(dir: &Path) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_mnem"));
+        command.env("MEMORY_DIR", dir);
+        command
+    }
+    /// The lines of `output` that show notes or summaries: the part of a
+    /// reply both tools must print identically.
+    pub(crate) fn shown(output: &Output) -> Vec<String> {
+        let mut lines = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if line.trim_start().starts_with('#') {
+                lines.push(line.to_owned());
+            }
+        }
+        lines
+    }
+
+    /// The block a nap prompt asks for, from its last `nap <lo>-<hi>` line.
+    pub(crate) fn asked_block(output: &Output) -> Option<String> {
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let mut asked = None;
+        for line in text.lines() {
+            if let Some((_, rest)) = line.split_once(" nap ") {
+                asked = rest.split(' ').next().map(str::to_owned);
+            }
+        }
+        asked
     }
 
     /// A fresh, empty directory for one test, deleted when the value is
@@ -637,5 +673,459 @@ fn mnem_waits_while_memo_holds_the_lock() {
     assert!(
         holder.wait().expect("python exits").success(),
         "memo releases cleanly"
+    );
+}
+
+/// Reads every part of `wake` from both tools as of `snapshot` notes and
+/// checks they print the same notes and summaries in the same parts.
+fn compare_wake(by_memo: &Path, by_mnem: &Path, snapshot: u64, case: &str) {
+    for part in 1_u64.. {
+        let args = ["wake".to_owned(), part.to_string(), snapshot.to_string()];
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let memo = harness::run_memo(by_memo, &args);
+        let mnem = harness::run_mnem(by_mnem, &args);
+        assert_eq!(
+            mnem.status.code(),
+            memo.status.code(),
+            "{case}, part {part}: same exit status"
+        );
+        assert_eq!(
+            harness::shown(&mnem),
+            harness::shown(&memo),
+            "{case}, part {part}: same lines"
+        );
+        assert_eq!(
+            harness::asked_block(&mnem),
+            harness::asked_block(&memo),
+            "{case}, part {part}: same summary asked for"
+        );
+        let memo_out = String::from_utf8_lossy(&memo.stdout).into_owned();
+        let mnem_out = String::from_utf8_lossy(&mnem.stdout).into_owned();
+        assert!(
+            !harness::shown(&memo).is_empty(),
+            "{case}, part {part}: memo showed something to compare"
+        );
+        let awake = memo_out.contains("You are awake.");
+        assert_eq!(
+            mnem_out.contains("You are awake."),
+            awake,
+            "{case}, part {part}: both finish on the same part"
+        );
+        if awake || !memo.status.success() {
+            break;
+        }
+    }
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn wake_matches_memo() {
+    let scratch = harness::scratch("wake");
+    let by_memo = scratch.path().join("by-memo");
+    let by_mnem = scratch.path().join("by-mnem");
+    py_build(&by_memo, 150, 1000);
+    let sizes = [
+        (96, 500, 20_000),
+        (20, 7, 20_000),
+        (7, 3, 20_000),
+        (3, 1, 20_000),
+        (1, 500, 20_000),
+        (40, 500, 300),
+        (96, 500, 1000),
+        (10, 500, 20),
+    ];
+    for (wake_lines, part_lines, part_chars) in sizes {
+        let wake = format!("WAKE_LINES={wake_lines}");
+        let part = format!("PART_LINES={part_lines}");
+        let chars = format!("PART_CHARS={part_chars}");
+        assert!(
+            harness::run_memo(&by_memo, &["config", &wake, &part, &chars])
+                .status
+                .success(),
+            "memo sets the sizes"
+        );
+        harness::copy_notebook(&by_memo, &by_mnem);
+        for snapshot in [150, 100, 33, 2, 1] {
+            compare_wake(
+                &by_memo,
+                &by_mnem,
+                snapshot,
+                &format!(
+                    "{wake_lines} lines, parts of {part_lines} lines and {part_chars} bytes, T={snapshot}"
+                ),
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn wake_refuses_like_memo() {
+    let scratch = harness::scratch("wake-refuses");
+    let by_memo = scratch.path().join("by-memo");
+    let by_mnem = scratch.path().join("by-mnem");
+    py_build(&by_memo, 150, 40);
+    harness::copy_notebook(&by_memo, &by_mnem);
+    let memo = harness::run_memo(&by_memo, &["wake"]);
+    let mnem = harness::run_mnem(&by_mnem, &["wake"]);
+    assert!(
+        !memo.status.success(),
+        "memo needs a summary it does not have"
+    );
+    assert_eq!(mnem.status.code(), memo.status.code(), "mnem refuses too");
+    assert_eq!(
+        harness::asked_block(&mnem),
+        harness::asked_block(&memo),
+        "for the same block"
+    );
+    assert_eq!(
+        harness::shown(&mnem),
+        harness::shown(&memo),
+        "showing the same input"
+    );
+    assert!(
+        harness::run_memo(&by_memo, &["config", "WAKE_LINES=200"])
+            .status
+            .success(),
+        "room for every note"
+    );
+    harness::copy_notebook(&by_memo, &by_mnem);
+    compare_wake(&by_memo, &by_mnem, 150, "awake, then a summary prompt");
+}
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn naps_match_memo() {
+    let scratch = harness::scratch("naps");
+    let by_memo = scratch.path().join("by-memo");
+    let by_mnem = scratch.path().join("by-mnem");
+    py_build(&by_memo, 70, 30);
+    harness::copy_notebook(&by_memo, &by_mnem);
+    let mut answered = 0;
+    loop {
+        let memo = harness::run_memo(&by_memo, &["nap"]);
+        let mnem = harness::run_mnem(&by_mnem, &["nap"]);
+        assert_eq!(
+            harness::shown(&mnem),
+            harness::shown(&memo),
+            "same prompt input"
+        );
+        let block = harness::asked_block(&memo);
+        assert_eq!(harness::asked_block(&mnem), block, "same block asked for");
+        let Some(block) = block else {
+            break;
+        };
+        let line = format!("answer for {block} \u{e9}");
+        assert!(
+            harness::run_memo(&by_memo, &["nap", &block, &line])
+                .status
+                .success(),
+            "memo saves {block}"
+        );
+        assert!(
+            harness::run_mnem(&by_mnem, &["nap", &block, &line])
+                .status
+                .success(),
+            "mnem saves {block}"
+        );
+        answered += 1;
+    }
+    assert!(
+        answered > 10,
+        "large blocks, built from halves, were prompted too"
+    );
+    assert_eq!(
+        harness::tree_files(&by_mnem),
+        harness::tree_files(&by_memo),
+        "identical TREE files"
+    );
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn recall_and_zoom_match_memo() {
+    let scratch = harness::scratch("recall");
+    let dir = scratch.path().join("nb");
+    py_build(&dir, 45, 30);
+    for pattern in [
+        "py note 1",
+        "\u{c9}",
+        "^#4",
+        "note (3|7) ",
+        "summary",
+        "absent",
+        "PY NOTE",
+    ] {
+        let memo = harness::run_memo(&dir, &["recall", pattern]);
+        let mnem = harness::run_mnem(&dir, &["recall", pattern]);
+        assert_eq!(
+            harness::shown(&memo).is_empty(),
+            matches!(pattern, "absent" | "summary"),
+            "recall {pattern:?}: memo found what it should; summaries are not searched"
+        );
+        assert_eq!(
+            harness::shown(&mnem),
+            harness::shown(&memo),
+            "recall {pattern:?}"
+        );
+    }
+    let memo_dir = scratch.path().join("small");
+    harness::copy_notebook(&dir, &memo_dir);
+    assert!(
+        harness::run_memo(&memo_dir, &["config", "PART_CHARS=200"])
+            .status
+            .success(),
+        "memo sets the cap"
+    );
+    let memo = harness::run_memo(&memo_dir, &["recall", "note"]);
+    let mnem = harness::run_mnem(&memo_dir, &["recall", "note"]);
+    assert_eq!(
+        harness::shown(&mnem),
+        harness::shown(&memo),
+        "the newest matches that fit"
+    );
+    assert!(harness::shown(&mnem).len() < 45, "the cap applied");
+    for block in ["0-1", "0-3", "16-31", "32-63", "40-47", "44-45", "0-63"] {
+        let memo = harness::run_memo(&dir, &["zoom", block]);
+        let mnem = harness::run_mnem(&dir, &["zoom", block]);
+        assert_eq!(
+            mnem.status.code(),
+            memo.status.code(),
+            "zoom {block}: same status"
+        );
+        let unbuilt = |lines: Vec<String>| -> Vec<String> {
+            let mut out = Vec::new();
+            for line in lines {
+                out.push(
+                    line.replace("not compressed yet", "-")
+                        .replace("not summarized yet", "-"),
+                );
+            }
+            out
+        };
+        assert_eq!(
+            unbuilt(harness::shown(&mnem)),
+            unbuilt(harness::shown(&memo)),
+            "zoom {block}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn notes_and_imports_match_memo() {
+    let scratch = harness::scratch("notes");
+    let by_memo = scratch.path().join("by-memo");
+    let by_mnem = scratch.path().join("by-mnem");
+    assert!(
+        harness::run_memo(&by_memo, &["init"]).status.success(),
+        "memo init"
+    );
+    assert!(
+        harness::run_mnem(&by_mnem, &["init"]).status.success(),
+        "mnem init"
+    );
+    let file = scratch.path().join("import.txt");
+    fs::write(
+        &file,
+        "2025-01-02 first \u{e9}\r\n\n2025-01-02  second  \r2025-03-04 third\n",
+    )
+    .expect("write");
+    let file = file.to_str().expect("a UTF-8 path");
+    assert!(
+        harness::run_memo(&by_memo, &["import", file])
+            .status
+            .success(),
+        "memo imports"
+    );
+    assert!(
+        harness::run_mnem(&by_mnem, &["import", file])
+            .status
+            .success(),
+        "mnem imports"
+    );
+    for text in ["  today's note \u{1F680} ", "another"] {
+        let memo = harness::run_memo(&by_memo, &["note", text]);
+        let mnem = harness::run_mnem(&by_mnem, &["note", text]);
+        assert!(memo.status.success(), "memo notes");
+        assert!(mnem.status.success(), "mnem notes");
+        assert_eq!(
+            harness::asked_block(&mnem),
+            harness::asked_block(&memo),
+            "same summary asked for"
+        );
+        assert_eq!(
+            harness::shown(&mnem),
+            harness::shown(&memo),
+            "showing the same notes"
+        );
+    }
+    assert_eq!(
+        fs::read(by_mnem.join("LOG.txt")).expect("log"),
+        fs::read(by_memo.join("LOG.txt")).expect("log"),
+        "identical logs, dated with the same local day"
+    );
+    for bad in [
+        "2024-01-01 before the last note\n",
+        "2026-02-30 no such day\n",
+        "\n",
+    ] {
+        let path = scratch.path().join("bad.txt");
+        fs::write(&path, bad).expect("write");
+        let path = path.to_str().expect("a UTF-8 path");
+        let memo = harness::run_memo(&by_memo, &["import", path]);
+        let mnem = harness::run_mnem(&by_mnem, &["import", path]);
+        assert!(!memo.status.success(), "memo rejects {bad:?}");
+        assert_eq!(
+            mnem.status.code(),
+            memo.status.code(),
+            "mnem rejects {bad:?}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn config_files_are_shared_with_memo() {
+    let scratch = harness::scratch("config");
+    let dir = scratch.path().join("nb");
+    assert!(
+        harness::run_memo(&dir, &["init"]).status.success(),
+        "memo creates the notebook"
+    );
+    let found = harness::run_mnem(&dir, &["init"]);
+    assert!(
+        String::from_utf8_lossy(&found.stdout).starts_with("Found "),
+        "mnem adopts it"
+    );
+    assert!(
+        harness::run_memo(&dir, &["config", "ENTRY_CHARS=200"])
+            .status
+            .success(),
+        "memo sets a size"
+    );
+    let shown = harness::run_mnem(&dir, &["config"]);
+    assert!(
+        String::from_utf8_lossy(&shown.stdout).contains("ENTRY_CHARS  200 "),
+        "mnem reads memo's file"
+    );
+    assert!(
+        harness::run_mnem(&dir, &["config", "WAKE_LINES=50", "ENTRY_CHARS="])
+            .status
+            .success(),
+        "mnem edits it"
+    );
+    let shown = String::from_utf8_lossy(&harness::run_memo(&dir, &["config"]).stdout).into_owned();
+    assert!(
+        shown.contains("WAKE_LINES   50 "),
+        "memo reads mnem's file: {shown}"
+    );
+    assert!(
+        shown.contains("ENTRY_CHARS  280 "),
+        "and the reset: {shown}"
+    );
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn nap_errors_match_memo() {
+    let scratch = harness::scratch("nap-errors");
+    let by_memo = scratch.path().join("by-memo");
+    let by_mnem = scratch.path().join("by-mnem");
+    py_build(&by_memo, 6, 0);
+    harness::copy_notebook(&by_memo, &by_mnem);
+    let steps: [&[&str]; 9] = [
+        &["nap", "2-3", "too early"],
+        &["nap", "0-7", "past the log"],
+        &["nap", "8-9", "past the log"],
+        &["nap", "0-2", "not a block"],
+        &["nap", "0-1", "  "],
+        &["nap", "0-1", "a", "b"],
+        &["nap", "0-1", "first pair"],
+        &["nap", "0-1", "again"],
+        &["nap", "2-3", "second pair"],
+    ];
+    for args in steps {
+        let memo = harness::run_memo(&by_memo, args);
+        let mnem = harness::run_mnem(&by_mnem, args);
+        assert_eq!(
+            mnem.status.code(),
+            memo.status.code(),
+            "{args:?}: same exit status"
+        );
+        assert_eq!(
+            mnem.stdout.is_empty(),
+            memo.stdout.is_empty(),
+            "{args:?}: same stdout use"
+        );
+        assert_eq!(
+            mnem.stderr.is_empty(),
+            memo.stderr.is_empty(),
+            "{args:?}: same stderr use"
+        );
+        assert_eq!(
+            harness::asked_block(&mnem),
+            harness::asked_block(&memo),
+            "{args:?}: same next block"
+        );
+        assert_eq!(
+            harness::tree_files(&by_mnem),
+            harness::tree_files(&by_memo),
+            "{args:?}: same files"
+        );
+    }
+    assert_eq!(
+        harness::tree_files(&by_mnem).len(),
+        1,
+        "two summaries were saved, both on the pair level"
+    );
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn notes_are_dated_in_the_local_time_zone() {
+    let scratch = harness::scratch("time-zones");
+    let mut days = Vec::new();
+    // UTC+14 and UTC-12 are 26 hours apart, so they never share a date.
+    for zone in ["Pacific/Kiritimati", "Etc/GMT+12"] {
+        let by_memo = scratch
+            .path()
+            .join(format!("memo-{}", zone.replace('/', "-")));
+        let by_mnem = scratch
+            .path()
+            .join(format!("mnem-{}", zone.replace('/', "-")));
+        assert!(
+            harness::run_memo(&by_memo, &["init"]).status.success(),
+            "memo init"
+        );
+        assert!(
+            harness::run_mnem(&by_mnem, &["init"]).status.success(),
+            "mnem init"
+        );
+        let memo = harness::memo_command(&by_memo)
+            .env("TZ", zone)
+            .args(["note", "dated"])
+            .output()
+            .expect("memo runs");
+        let mnem = harness::mnem_command(&by_mnem)
+            .env("TZ", zone)
+            .args(["note", "dated"])
+            .output()
+            .expect("mnem runs");
+        assert!(
+            memo.status.success() && mnem.status.success(),
+            "{zone}: both note"
+        );
+        let log = fs::read(by_mnem.join("LOG.txt")).expect("log");
+        assert_eq!(
+            log,
+            fs::read(by_memo.join("LOG.txt")).expect("log"),
+            "{zone}: same date"
+        );
+        days.push(record::decode_note(&log).expect("one record").day);
+    }
+    assert_ne!(
+        days.first(),
+        days.last(),
+        "the time zone was honoured: {days:?}"
     );
 }
