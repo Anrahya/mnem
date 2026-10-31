@@ -1,8 +1,10 @@
 //! What the tags in the log say, gathered in one scan.
 //!
 //! Nothing here is stored: every command that needs the index rebuilds it
-//! from `LOG.txt`, so it can never disagree with the notes. One scan of a
-//! year's notes (about 16 MB) takes milliseconds.
+//! from `LOG.txt`, so it can never disagree with the notes. A correction
+//! always comes after the note it corrects, so `wake` and `zoom` read only
+//! from the first note they show onward; `recall` and `day` read the whole
+//! log, about 16 MB for a busy year.
 
 use std::collections::HashMap;
 
@@ -26,11 +28,17 @@ pub struct TagIndex {
 }
 
 impl TagIndex {
-    /// Reads every note's tags.
-    pub fn build(notebook: &Notebook) -> Result<Self, NotebookError> {
+    /// Reads the tags of notes `first` up to, not including, `end`.
+    /// Corrections of notes from `first` on are all found, since they come
+    /// later; stopping at `end` keeps the marks to a snapshot of the log.
+    pub fn build(notebook: &Notebook, first: u64, end: u64) -> Result<Self, NotebookError> {
         let mut index = Self::default();
-        for note in notebook.scan()? {
-            index.add(&note?);
+        for note in notebook.scan_from(first)? {
+            let note = note?;
+            if note.id >= end {
+                break;
+            }
+            index.add(&note);
         }
         Ok(index)
     }

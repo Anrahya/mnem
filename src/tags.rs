@@ -132,8 +132,9 @@ fn candidates(text: &str) -> Vec<(&str, Keyword, &str)> {
         let Some((inside, after_close)) = after_open.split_once(']') else {
             break;
         };
-        rest = after_close;
         let Some((word, value)) = inside.split_once(' ') else {
+            // Not a tag, but a tag may open inside it, as in "[[on …]]".
+            rest = after_open;
             continue;
         };
         let value = value.trim();
@@ -141,8 +142,12 @@ fn candidates(text: &str) -> Vec<(&str, Keyword, &str)> {
             "on" if value.starts_with(|c: char| c.is_ascii_digit()) => Keyword::On,
             "updates" if value.starts_with('#') => Keyword::Updates,
             "at" if value.starts_with(|c: char| c.is_ascii_digit()) => Keyword::At,
-            _ => continue,
+            _ => {
+                rest = after_open;
+                continue;
+            }
         };
+        rest = after_close;
         found.push((inside, keyword, value));
     }
     found
@@ -184,8 +189,9 @@ fn reminder(value: &str) -> Option<Reminder> {
 /// A local time written `YYYY-MM-DDTHH:MM`.
 pub fn date_time(value: &str) -> Option<DateTime> {
     let (day, time) = value.split_once('T')?;
-    let date = date(&Day::try_new(day).ok()?)?;
-    Some(DateTime::from_parts(date, clock(time)?))
+    // Day checks the exact YYYY-MM-DD form; jiff alone accepts others.
+    let on = date(&Day::try_new(day).ok()?)?;
+    Some(DateTime::from_parts(on, clock(time)?))
 }
 
 /// A wall-clock time written `HH:MM`.
@@ -205,11 +211,7 @@ fn two_digits(value: &str) -> Option<i8> {
 
 /// The calendar date of a [`Day`].
 pub fn date(day: &Day) -> Option<Date> {
-    let mut parts = day.as_str().split('-');
-    let year = parts.next()?.parse::<i16>().ok()?;
-    let month = parts.next()?.parse::<i8>().ok()?;
-    let day = parts.next()?.parse::<i8>().ok()?;
-    Date::new(year, month, day).ok()
+    day.as_str().parse::<Date>().ok()
 }
 
 impl fmt::Display for TagError {
@@ -283,6 +285,7 @@ mod tests {
             "[updates] later",
             "[sic]",
             "unclosed [on 2026-10-01",
+            "[[sic]]",
         ] {
             assert_eq!(
                 tags::parse(text),
@@ -290,6 +293,20 @@ mod tests {
                 "{text:?} has no tags"
             );
         }
+    }
+
+    #[test]
+    fn tags_inside_other_brackets_are_found() {
+        let parsed =
+            tags::parse("[[updates #1]] see [foo [on 2026-10-01]] and [x] [at 2026-10-02T09:00]")
+                .expect("valid tags");
+        assert_eq!(parsed.updates, [1], "a doubled bracket still holds the tag");
+        assert_eq!(
+            parsed.happened,
+            Some(Day::try_new("2026-10-01").expect("a date")),
+            "a tag inside an ordinary bracket counts"
+        );
+        assert!(parsed.reminder.is_some(), "scanning goes on after them");
     }
 
     #[test]

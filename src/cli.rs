@@ -11,6 +11,7 @@
 //! This is the stock OptMem flow: when a summary is due, `note`, `wake` and
 //! `nap` print a prompt asking the agent to write it.
 
+use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::fs;
@@ -48,6 +49,10 @@ use crate::text::TextError;
 /// `\w{1000}` expand far past the regex crate's default limit, because `\w`
 /// covers all of Unicode.
 const RECALL_REGEX_BYTES: usize = 256 << 20;
+
+/// How many of the latest notes a new note is compared with to spot a
+/// repeat, so `note` stays fast however long the log grows.
+const REPEAT_WINDOW: u64 = 4096;
 
 /// What a command needs from outside the notebook.
 #[derive(Clone, Debug)]
@@ -433,7 +438,13 @@ enum Document {
 fn document(context: &Context, notebook: &Notebook, notes: u64) -> Result<Document, Failure> {
     let spans = cover::cover(notes, notebook.config().wake_lines())
         .map_err(|error| Failure::Said(error.to_string()))?;
-    let index = TagIndex::build(notebook)?;
+    let mut first_note = notes;
+    for span in &spans {
+        if span.is_note() {
+            first_note = first_note.min(span.lo());
+        }
+    }
+    let index = TagIndex::build(notebook, first_note, notes)?;
     let mut lines = Vec::new();
     for span in spans {
         if span.is_note() {
@@ -505,15 +516,16 @@ fn note(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
     let text =
         Text::try_new(raw, limit).map_err(|error| Failure::Said(text_problem(&error, "note")))?;
     let found = checked_tags(text.as_str(), notebook.len()?).map_err(Failure::Said)?;
+    let print = simhash::fingerprint(text.as_str());
     let id = notebook.append(&[(context.today.clone(), text)])?;
     let notes = id.checked_add(1).ok_or(NotebookError::Overflow)?;
     let mut out = vec![format!("Noted as #{id}.")];
-    if let Some(similar) = repeat_of(notebook, id, &found.updates)? {
+    if let Some(print) = print
+        && let Some(similar) = repeat_of(notebook, id, print, &found.updates)?
+    {
         out.push(format!(
-            "It repeats #{}: {}\nIf it corrects that note, note the correction with [updates #{}]; otherwise there is nothing to do.",
-            similar.id,
-            similar.text,
-            similar.id
+            "It nearly repeats #{}: {}\nNothing more to do now. Before noting, {} recall shows what is already there.",
+            similar.id, similar.text, context.me
         ));
     }
     with_next_summary(context, notebook, out, notes)
@@ -534,25 +546,37 @@ fn checked_tags(text: &str, before: u64) -> Result<tags::Tags, String> {
     Ok(found)
 }
 
-/// The newest earlier note that note `id` nearly repeats, unless `id` says
-/// it corrects that note.
-fn repeat_of(notebook: &Notebook, id: u64, corrects: &[u64]) -> Result<Option<Note>, Failure> {
-    let new = notebook.note(id)?;
-    let print = simhash::fingerprint(&new.text);
-    let mut newest = None;
-    for note in notebook.scan()? {
+/// The newest of the [`REPEAT_WINDOW`] notes before `id` that note `id`,
+/// whose fingerprint is `print`, nearly repeats. Notes it corrects, and
+/// notes already superseded, do not count: saying again what was
+/// corrected away is news.
+fn repeat_of(
+    notebook: &Notebook,
+    id: u64,
+    print: u64,
+    corrects: &[u64],
+) -> Result<Option<Note>, Failure> {
+    let mut index = TagIndex::default();
+    let mut near = Vec::new();
+    for note in notebook.scan_from(id.saturating_sub(REPEAT_WINDOW))? {
         let note = note?;
         if note.id >= id {
             break;
         }
+        index.add(&note);
         if corrects.contains(&note.id) {
             continue;
         }
-        if simhash::distance(print, simhash::fingerprint(&note.text)) <= simhash::NEAR {
-            newest = Some(note);
+        if let Some(other) = simhash::fingerprint(&note.text)
+            && simhash::distance(print, other) <= simhash::NEAR
+        {
+            near.push(note);
         }
     }
-    Ok(newest)
+    Ok(near
+        .into_iter()
+        .rev()
+        .find(|note| index.superseded_by(note.id).is_none()))
 }
 
 fn nap(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
@@ -654,7 +678,7 @@ fn recall(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
     // Matches beyond the output cap push out the oldest ones kept, so memory
     // stays bounded however loose the pattern is.
     let limit = notebook.config().part_chars();
-    let index = TagIndex::build(notebook)?;
+    let index = TagIndex::build(notebook, 0, u64::MAX)?;
     let mut kept: VecDeque<String> = VecDeque::new();
     let mut size: usize = 0;
     let mut hits: u64 = 0;
@@ -709,7 +733,7 @@ fn zoom(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
             context.me
         )));
     }
-    let index = TagIndex::build(notebook)?;
+    let index = TagIndex::build(notebook, block.lo(), notes)?;
     let mut out = Vec::new();
     if let Some((first, second)) = block.halves() {
         for half in [first, second] {
@@ -740,11 +764,14 @@ fn day(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
         DayError::NotADate => Failure::Said(format!("{raw} is not a real date.")),
     })?;
     let date = tags::date(&wanted);
-    let index = TagIndex::build(notebook)?;
-    let mut ids = index.happened_on(&wanted);
+    let index = TagIndex::build(notebook, 0, u64::MAX)?;
+    let mut ids: HashSet<u64> = index.happened_on(&wanted).into_iter().collect();
     for (id, reminder) in index.reminders() {
-        if Some(reminder.at.date()) == date {
-            ids.push(*id);
+        // A reminder is due on every day from its start to its end.
+        let start = reminder.at.date();
+        let end = reminder.until.map_or(start, |until| until.date());
+        if date.is_some_and(|date| start <= date && date <= end) {
+            ids.insert(*id);
         }
     }
     // Like recall, keep the newest lines that fit in one part.
@@ -1623,6 +1650,10 @@ mod tests {
             ok(&context, &["wake"]).contains("#2 2026-10-31 [updates #1] Moved to Delhi\n"),
             "the newest note is shown as written"
         );
+        assert!(
+            ok(&context, &["wake", "1", "2"]).contains("#0 2026-10-31 [superseded by #1] Lives"),
+            "a snapshot ignores corrections written after it"
+        );
     }
 
     #[test]
@@ -1637,6 +1668,22 @@ mod tests {
         .expect("write");
         ok(&context, &["import", file.to_str().expect("a UTF-8 path")]);
         ok(&context, &["note", "Dentist [at 2026-10-20T09:00]"]);
+        ok(
+            &context,
+            &["note", "Trip [at 2026-10-24T22:00 until 2026-10-26T08:00]"],
+        );
+        for (day, shown) in [
+            ("2026-10-23", false),
+            ("2026-10-25", true),
+            ("2026-10-26", true),
+            ("2026-10-27", false),
+        ] {
+            assert_eq!(
+                ok(&context, &["day", day]).contains("Trip"),
+                shown,
+                "a reminder is due on {day} only inside its window"
+            );
+        }
         assert_eq!(
             ok(&context, &["day", "2026-10-20"]),
             "#0 2026-10-20 Paid rent\n\
@@ -1646,8 +1693,8 @@ mod tests {
             "written, happened and due that day, in log order"
         );
         assert_eq!(
-            ok(&context, &["day", "2026-10-25"]),
-            "No notes for 2026-10-25.\n",
+            ok(&context, &["day", "2026-10-29"]),
+            "No notes for 2026-10-29.\n",
             "an empty day"
         );
         assert!(
@@ -1664,30 +1711,38 @@ mod tests {
     fn near_repeats_are_pointed_out() {
         let scratch = Scratch::new();
         let context = notebook_with(&scratch, 0);
-        ok(
-            &context,
-            &["note", "Prefers green tea in the morning, no sugar"],
-        );
+        let tea = "Prefers green tea in the morning with no sugar and a slice of lemon";
+        ok(&context, &["note", tea]);
         ok(&context, &["note", "Bought spinach"]);
-        let reply = ok(
-            &context,
-            &["note", "prefers green tea in the morning, no sugar!"],
-        );
+        let repeat = ok(&context, &["note", &tea.to_uppercase()]);
         assert!(
-            reply.starts_with("Noted as #2.\nIt repeats #0: Prefers green tea"),
-            "the repeat is saved and pointed out: {reply}"
+            repeat.starts_with("Noted as #2.\nIt nearly repeats #0: Prefers green tea"),
+            "the repeat is saved and pointed out: {repeat}"
         );
-        let correcting = ok(
-            &context,
-            &[
-                "note",
-                "[updates #0] Prefers green tea in the morning, no sugar",
-            ],
-        );
+        let correcting = ok(&context, &["note", &format!("[updates #2] {tea}")]);
         assert!(
-            !correcting.contains("repeats #0"),
-            "a note that corrects its near twin is not a repeat: {correcting}"
+            correcting.contains("nearly repeats #0"),
+            "correcting one twin does not excuse repeating the other: {correcting}"
         );
+        let scratch = Scratch::new();
+        let context = notebook_with(&scratch, 0);
+        ok(&context, &["note", tea]);
+        let only_twin = ok(&context, &["note", &format!("[updates #0] {tea}")]);
+        assert!(
+            !only_twin.contains("repeats"),
+            "a note that corrects its only twin is not a repeat: {only_twin}"
+        );
+        let again = ok(&context, &["note", tea]);
+        assert!(
+            again.contains("nearly repeats #1"),
+            "the superseded #0 is passed over for #1: {again}"
+        );
+        for short in ["👍", "✅"] {
+            assert!(
+                !ok(&context, &["note", short]).contains("repeats"),
+                "notes too short to compare are never repeats"
+            );
+        }
     }
 
     #[test]

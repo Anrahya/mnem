@@ -197,14 +197,23 @@ impl Notebook {
     /// in memory. A partial record at the end, left by a crash, ends the
     /// stream.
     pub fn scan(&self) -> Result<NoteScan, NotebookError> {
+        self.scan_from(0)
+    }
+
+    /// Like [`Notebook::scan`], starting at note `first`; past the end, the
+    /// stream is empty.
+    pub fn scan_from(&self, first: u64) -> Result<NoteScan, NotebookError> {
         let path = self.log_path();
-        let file = File::open(&path).map_err(|source| io_error(&path, source))?;
+        let mut file = File::open(&path).map_err(|source| io_error(&path, source))?;
+        let offset = first.checked_mul(LOG_REC).ok_or(NotebookError::Overflow)?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|source| io_error(&path, source))?;
         let width = usize::try_from(LOG_REC).map_err(|_too_wide| NotebookError::Overflow)?;
         Ok(NoteScan {
             reader: BufReader::with_capacity(1 << 16, file),
             width,
             path,
-            offset: 0,
+            offset,
             done: false,
         })
     }
