@@ -11,7 +11,7 @@ context and the session entry points work and are tested; no harness is wired
 to them yet.
 
 Design: [Mnem: A Memory System for Proactive Agents](https://claude.ai/artifact/5VHSbkX5WpDaiS3PHd2xJT)
-(draft 3).
+(draft 4).
 
 ## Wiring it to a harness
 
