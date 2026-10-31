@@ -11,6 +11,11 @@
 //!
 //! Notes carry their author as a leading `[by <author>]`, so several agents
 //! can share one notebook and the notebook format stays OptMem's.
+//!
+//! One driver per notebook runs the summarizer: this library or the `mnem`
+//! command's background runs, not both. Two drivers stay correct, since
+//! every summary is saved under the notebook's lock, but they can waste
+//! model calls on the same block.
 
 use std::collections::VecDeque;
 use std::error::Error;
@@ -149,14 +154,14 @@ impl Memory {
     /// Creates the notebook at `dir` if it does not exist, and opens it.
     pub fn create(dir: &Path) -> Result<Self, MemoryError> {
         Ok(Self {
-            notebook: Notebook::init(dir)?,
+            notebook: Notebook::init(dir).map_err(|error| opening(dir, error))?,
         })
     }
 
     /// Opens the existing notebook at `dir`.
     pub fn open(dir: &Path) -> Result<Self, MemoryError> {
         Ok(Self {
-            notebook: Notebook::open(dir)?,
+            notebook: Notebook::open(dir).map_err(|error| opening(dir, error))?,
         })
     }
 
@@ -314,7 +319,9 @@ impl Memory {
             compactor::Next::Job(job) => Ok(Some(job)),
             compactor::Next::Blank { block, half } => Err(MemoryError::Corrupt {
                 path: self.dir().join("TREE"),
-                detail: format!("#{block} is built from #{half}, whose summary record is empty"),
+                detail: format!(
+                    "#{block} is built from #{half}, whose summary record is empty; forget #{half} to have it written again"
+                ),
             }),
         }
     }
@@ -343,15 +350,18 @@ impl Memory {
         user: Option<&str>,
         now: DateTime,
     ) -> Result<Option<DreamJob>, MemoryError> {
-        Ok(match dream::job(&self.notebook, trigger, user, now)? {
-            Prepared::Tidied { .. } => None,
-            Prepared::Job(job) => Some(job),
-        })
+        match dream::job(&self.notebook, trigger, user, now)? {
+            Prepared::Tidied { .. } => Ok(None),
+            Prepared::Job(job) => Ok(Some(job)),
+            Prepared::Busy => Err(dreaming()),
+        }
     }
 
     /// Checks the model's `answer` to the dream `id`, and if it holds up,
     /// replaces MIND.md. A rejected or declined answer counts toward
-    /// Dream's give-up rule and changes nothing else.
+    /// Dream's give-up rule and changes nothing else, so pass
+    /// [`Answer::Declined`] only when the model declined; when it could not
+    /// be reached, do not apply at all.
     pub fn apply_dream(
         &self,
         id: &DreamId,
@@ -360,8 +370,16 @@ impl Memory {
     ) -> Result<dream::Report, MemoryError> {
         dream::apply(&self.notebook, id, answer, now).map_err(|error| match error {
             dream::ApplyError::Stale(message) => MemoryError::Conflict { message },
+            dream::ApplyError::Busy => dreaming(),
             dream::ApplyError::Notebook(error) => error.into(),
         })
+    }
+
+    /// Forgets the summary of `block` and every summary built on it, so they
+    /// are written again. Returns the blocks forgotten. Notes are never
+    /// forgotten.
+    pub fn forget(&self, block: Span) -> Result<Vec<Span>, MemoryError> {
+        Ok(self.notebook.forget(block)?)
     }
 
     /// Everything the heartbeat should schedule as of `now`.
@@ -393,6 +411,9 @@ impl Memory {
                 "{id:?} is not an item id: use the id from the agenda, such as \"call-mom\" or \"r12\"."
             )));
         }
+        // The ledger keeps minutes; compare and record at that precision.
+        let due = due.map(minute);
+        let at = minute(at);
         let held = fired::hold(self.dir())?;
         let ledger = fired::read(self.dir())?;
         if ledger
@@ -434,6 +455,17 @@ fn checked_author(author: &str) -> Result<&str, MemoryError> {
     Ok(author)
 }
 
+/// An error opening the notebook at `dir`, with the config file's full path.
+fn opening(dir: &Path, error: NotebookError) -> MemoryError {
+    if matches!(error, NotebookError::Config(_)) {
+        return MemoryError::Corrupt {
+            path: dir.join("config"),
+            detail: error.to_string(),
+        };
+    }
+    error.into()
+}
+
 fn view(index: &TagIndex, note: Note) -> NoteView {
     let tags = tags::parse_lenient(&note.text);
     let (author, text) = strip_author(&note.text);
@@ -454,6 +486,20 @@ fn note_problem(error: &TextError, limit: usize) -> String {
         TextError::TooLong { .. } => format!(
             "The note, with its [by …] prefix, is over {limit} bytes; shorten it or split it into two notes."
         ),
+    }
+}
+
+fn minute(time: DateTime) -> DateTime {
+    time.with()
+        .second(0)
+        .subsec_nanosecond(0)
+        .build()
+        .unwrap_or(time)
+}
+
+fn dreaming() -> MemoryError {
+    MemoryError::Conflict {
+        message: "another dream is running on this notebook; ask again when it ends".to_owned(),
     }
 }
 
@@ -780,30 +826,84 @@ mod tests {
     #[test]
     fn a_summary_job_over_changed_input_is_stale() {
         let scratch = Scratch::new();
-        let mut notes = Vec::new();
-        for text in ["a", "b", "c", "d"] {
-            notes.push(("2026-10-28T09:00", "Arcee", text));
-        }
-        let memory = memory(&scratch, &notes);
-        for _ in 0..2 {
-            let job = memory.compaction_job().expect("job").expect("a pair");
+        let memory = Memory::create(&scratch.path).expect("a new notebook");
+        for n in 0..32 {
             memory
-                .apply_compaction(&job.id, reply("pair"))
+                .note("Arcee", &format!("note {n}"), at("2026-10-28T09:00"))
                 .expect("saved");
         }
-        let parent = memory.compaction_job().expect("job").expect("0-3");
-        assert_eq!(parent.id.block, block("0-3"), "built from the pairs");
-        let notebook = crate::notebook::Notebook::open(&scratch.path).expect("open");
-        notebook.forget(block("0-1")).expect("forget");
-        let text = crate::text::Text::try_new("rewritten", 280).expect("text");
-        notebook.put_summary(block("0-1"), &text).expect("put");
+        // Blocks up to 16 notes are summarized from notes; 0-31 is built
+        // from the summaries of its halves.
+        let parent = loop {
+            let job = memory.compaction_job().expect("job").expect("one is due");
+            if job.id.block == block("0-31") {
+                break job;
+            }
+            memory
+                .apply_compaction(&job.id, reply(&format!("summary of {}", job.id.block)))
+                .expect("saved");
+        };
+        memory.forget(block("16-31")).expect("forget");
+        let half = memory.compaction_job().expect("job").expect("16-31 again");
+        assert_eq!(
+            half.id.block,
+            block("16-31"),
+            "the forgotten half comes first"
+        );
+        memory
+            .apply_compaction(&half.id, reply("a different summary"))
+            .expect("saved");
+        let again = memory.compaction_job().expect("job").expect("0-31 again");
+        assert_eq!(again.id.block, parent.id.block, "the same block is due");
+        assert_ne!(again.id.digest, parent.id.digest, "with new input");
         assert!(
             matches!(
                 memory.apply_compaction(&parent.id, reply("whole")),
+                Err(MemoryError::Conflict { message }) if message.contains("input")
+            ),
+            "an answer about the old halves is refused"
+        );
+        assert_eq!(
+            memory
+                .apply_compaction(&again.id, reply("whole"))
+                .expect("applied"),
+            Applied::Saved(crate::compactor::Written::ByModel),
+            "the current job saves"
+        );
+    }
+
+    #[test]
+    fn fired_times_are_kept_to_the_minute() {
+        let scratch = Scratch::new();
+        let memory = memory(&scratch, &[]);
+        for raw in ["2026-10-31T08:00:15", "2026-10-31T08:00:45"] {
+            let time: DateTime = raw.parse().expect("a time with seconds");
+            memory
+                .record_fired("tea", Some(time), time)
+                .expect("recorded");
+        }
+        let ledger = crate::fired::read(&scratch.path).expect("ledger");
+        assert_eq!(ledger.len(), 1, "seconds do not make a second entry");
+    }
+
+    #[test]
+    fn a_dream_never_waits_for_another() {
+        let scratch = Scratch::new();
+        let memory = memory(&scratch, &NOTES);
+        let held = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(scratch.path.join(".dream.lock"))
+            .expect("lock file");
+        held.lock().expect("lock");
+        assert!(
+            matches!(
+                memory.dream_job(Trigger::Nightly, None, at("2026-10-31T03:00")),
                 Err(MemoryError::Conflict { .. })
             ),
-            "its half changed after the job was made"
+            "busy is a conflict, not a wait"
         );
+        held.unlock().expect("unlock");
     }
 
     const NOTES: [(&str, &str, &str); 5] = [

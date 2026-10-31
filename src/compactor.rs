@@ -229,8 +229,9 @@ pub enum Next {
 pub enum Applied {
     /// The summary was saved.
     Saved(Written),
-    /// Another writer saved the block's summary first, or a retried answer
-    /// was saved already; nothing more to do for it.
+    /// Nothing more to do for this job: the summary was saved already (by
+    /// another writer, or by this answer retried), or the block changed
+    /// while it was being written and is due again with new input.
     Settled,
     /// The line was too long: ask again with this job.
     Retry(SummaryJob),
@@ -320,8 +321,15 @@ pub fn apply(notebook: &Notebook, id: &SummaryId, answer: Answer) -> Result<Appl
     let mut tries = current_tries(notebook.dir(), block, &input)?;
     if tries.id != *id {
         return Err(ApplyError::Stale(format!(
-            "this answer is for try {} at #{block}, but try {} is current, or its input changed",
-            id.attempt, tries.id.attempt
+            "{}; ask for the current job",
+            if tries.id.digest == id.digest {
+                format!(
+                    "this answer is for try {} at #{block}, but try {} is current",
+                    id.attempt, tries.id.attempt
+                )
+            } else {
+                format!("the input of #{block} changed after this job was made")
+            }
         )));
     }
     let limit = notebook.config().entry_chars();
@@ -376,12 +384,17 @@ fn save(
     input: &Input,
     how: Written,
 ) -> Result<Applied, ApplyError> {
-    let outcome = notebook.put_summary_over(block, text, &input.sources)?;
-    files::remove(&notebook.dir().join(JOB))?;
-    Ok(match outcome {
-        PutOutcome::Saved => Applied::Saved(how),
-        PutOutcome::NotNext => Applied::Settled,
-    })
+    Ok(
+        match notebook.put_summary_over(block, text, &input.sources)? {
+            PutOutcome::Saved => {
+                files::remove(&notebook.dir().join(JOB))?;
+                Applied::Saved(how)
+            }
+            // The tries kept are for this block's old input, so the next job
+            // ignores them.
+            PutOutcome::NotNext => Applied::Settled,
+        },
+    )
 }
 
 /// The tries kept for `block` with this `input`, or a first try.

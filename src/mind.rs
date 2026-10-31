@@ -362,32 +362,59 @@ pub fn cites(text: &str) -> Vec<u64> {
 }
 
 /// Gives each nudge of `draft` that Dream renamed the id it had in `old`,
-/// so the fired ledger and the harness's schedule still recognize it. A
-/// nudge with a new id takes the id of an old nudge not carried over that is
-/// due at the same time and cites a note in common with it, or that asks
-/// for the same thing in the same words.
+/// so the fired ledger and the harness's schedule still recognize it.
+///
+/// A renamed nudge can only take the id of an old nudge that is due at the
+/// same time and was not carried over. Among those, the same request in the
+/// same words with a note cited in common is the best match, then the same
+/// words alone. A timed nudge may also match on a shared cite alone; an
+/// untimed one may not, since every next-session nudge has the same time.
+/// The best matches are taken first, so two renamed nudges cannot swap ids.
 pub fn keep_ids(draft: &mut Mind, old: &Mind) {
     let mut taken: HashSet<String> = HashSet::new();
     for nudge in &draft.nudges {
         taken.insert(nudge.id.clone());
     }
-    for nudge in &mut draft.nudges {
+    let mut pairs = Vec::new();
+    for (renamed, nudge) in draft.nudges.iter().enumerate() {
         if old.nudges.iter().any(|previous| previous.id == nudge.id) {
             continue;
         }
         let cited: HashSet<u64> = cites(&nudge.why).into_iter().collect();
         let action = plain(&nudge.action);
-        for previous in &old.nudges {
-            if taken.contains(&previous.id) {
+        let mut by_cite = Vec::new();
+        for (was, previous) in old.nudges.iter().enumerate() {
+            if taken.contains(&previous.id) || previous.when != nudge.when {
                 continue;
             }
-            let same_time = previous.when == nudge.when
-                && cites(&previous.why).iter().any(|id| cited.contains(id));
-            if same_time || plain(&previous.action) == action {
-                taken.insert(previous.id.clone());
-                nudge.id.clone_from(&previous.id);
-                break;
+            let same_words = plain(&previous.action) == action;
+            let shared = cites(&previous.why).iter().any(|id| cited.contains(id));
+            match (same_words, shared) {
+                (true, true) => pairs.push((3, renamed, was)),
+                (true, false) => pairs.push((2, renamed, was)),
+                (false, true) if matches!(nudge.when, When::At(_)) => by_cite.push(was),
+                _ => {}
             }
+        }
+        // A shared cite alone is weak evidence: it counts only when it
+        // points at one old nudge.
+        if let [was] = by_cite.as_slice() {
+            pairs.push((1, renamed, *was));
+        }
+    }
+    // Best first; ties keep draft order, then old order.
+    pairs.sort_by_key(|&(score, renamed, was)| (std::cmp::Reverse(score), renamed, was));
+    let mut renamed_done: HashSet<usize> = HashSet::new();
+    let mut old_done: HashSet<usize> = HashSet::new();
+    for (_, renamed, was) in pairs {
+        if renamed_done.contains(&renamed) || old_done.contains(&was) {
+            continue;
+        }
+        if let (Some(nudge), Some(previous)) = (draft.nudges.get_mut(renamed), old.nudges.get(was))
+        {
+            nudge.id.clone_from(&previous.id);
+            renamed_done.insert(renamed);
+            old_done.insert(was);
         }
     }
 }
@@ -900,64 +927,43 @@ mod tests {
 
     #[test]
     fn renamed_nudges_keep_their_ids() {
-        let nudge = |id: &str, when: When, action: &str, why: &str| Nudge {
+        let nudge = |id: &str, when: &When, action: &str, why: &str| Nudge {
             id: id.to_owned(),
-            when,
+            when: when.clone(),
             until: None,
             action: action.to_owned(),
             why: why.to_owned(),
             notify: true,
         };
         let morning = When::At(at("2026-11-01T08:00"));
+        let evening = When::At(at("2026-11-01T20:00"));
+        let session = When::NextSession;
         let old = Mind {
             nudges: vec![
-                nudge(
-                    "eggs",
-                    morning.clone(),
-                    "Suggest an omelette",
-                    "Bought eggs (#4)",
-                ),
-                nudge(
-                    "call",
-                    When::NextSession,
-                    "Call the bank",
-                    "Card blocked (#7)",
-                ),
-                nudge(
-                    "kept",
-                    When::NextSession,
-                    "Water the plants",
-                    "Dry soil (#9)",
-                ),
+                nudge("milk", &morning, "Buy milk", "Out of milk (#4)"),
+                nudge("eggs", &morning, "Suggest an omelette", "Bought eggs (#4)"),
+                nudge("am", &morning, "Take vitamins", "Doctor said (#2)"),
+                nudge("pm", &evening, "Take vitamins", "Doctor said (#2)"),
+                nudge("move", &session, "Ask about the move", "Moved (#3)"),
+                nudge("plants", &session, "Water the plants", "Dry soil (#9)"),
+                nudge("call", &evening, "Call the bank", "Card blocked (#7)"),
             ],
             ..Mind::default()
         };
         let mut draft = Mind {
             nudges: vec![
+                nudge("m2", &morning, "Suggest an  OMELETTE", "Eggs left (#4, #5)"),
+                nudge("v2", &evening, "Take vitamins", "Doctor said (#2)"),
                 nudge(
-                    "omelette",
-                    morning,
-                    "Offer to cook eggs",
-                    "Eggs in the fridge (#4, #5)",
+                    "job",
+                    &session,
+                    "Ask how the new job is going",
+                    "New job (#3, #8)",
                 ),
-                nudge(
-                    "bank",
-                    When::Event("home".to_owned()),
-                    "call  the BANK",
-                    "Still blocked (#8)",
-                ),
-                nudge(
-                    "kept",
-                    When::NextSession,
-                    "Water the plants",
-                    "Dry soil (#9)",
-                ),
-                nudge(
-                    "new",
-                    When::NextSession,
-                    "Water the plants",
-                    "Dry again (#10)",
-                ),
+                nudge("plants", &session, "Water the plants", "Dry soil (#9)"),
+                nudge("p2", &session, "Water the plants", "Dry again (#10)"),
+                nudge("cook", &morning, "Cook breakfast", "Hungry (#4)"),
+                nudge("bank", &evening, "Phone the bank", "Still blocked (#7)"),
             ],
             ..Mind::default()
         };
@@ -965,8 +971,8 @@ mod tests {
         let ids: Vec<&str> = draft.nudges.iter().map(|item| item.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["eggs", "call", "kept", "new"],
-            "same time and a shared cite, or the same words, keep the old id; an id carried over is not taken twice"
+            ["eggs", "pm", "job", "plants", "p2", "cook", "call"],
+            "same words win, times must match, untimed nudges need the same words, an ambiguous cite matches nothing, a unique one does, and a carried-over id is not taken twice"
         );
     }
 }
