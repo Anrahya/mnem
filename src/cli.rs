@@ -94,6 +94,9 @@ pub struct Reply {
     /// Whether summaries are due and the summarizer should start in the
     /// background once the reply is out.
     pub compact: bool,
+    /// Whether a pre-compaction dream should start in the background once
+    /// the reply is out.
+    pub dream: bool,
 }
 
 impl Reply {
@@ -104,6 +107,7 @@ impl Reply {
             stderr: format!("{message}\n"),
             code: 1,
             compact: false,
+            dream: false,
         }
     }
 
@@ -113,6 +117,7 @@ impl Reply {
             stderr: String::new(),
             code: 0,
             compact: false,
+            dream: false,
         }
     }
 
@@ -124,6 +129,7 @@ impl Reply {
             stderr: String::new(),
             code: 1,
             compact: false,
+            dream: false,
         }
     }
 }
@@ -171,6 +177,7 @@ pub fn run(context: &Context, args: &[OsString]) -> Reply {
                 .and_then(|notebook| command(context, &notebook, rest)),
             None => Ok(Reply {
                 compact: false,
+                dream: false,
                 stdout: String::new(),
                 stderr: format!("No such command: {command}\n\n{}\n", usage(context)),
                 code: 1,
@@ -203,6 +210,7 @@ fn command_named(name: &str) -> Option<Command> {
         "next" => next,
         "brief" => brief,
         "fired" => fired_command,
+        "session" => session,
         _ => return None,
     };
     Some(command)
@@ -225,6 +233,11 @@ fn usage(context: &Context) -> String {
          \x20 compact                  write every due summary with the summarizer\n\
          \x20 dream <when>             rewrite MIND.md from new notes; <when> is nightly,\n\
          \x20                          idle or compact (for schedulers and hooks)\n\n\
+         Sessions (for the harness's hooks)\n\
+         \x20 session start            a session's first command: MIND.md, what is due, wake\n\
+         \x20 session compact          dream in the background before the context is compacted\n\
+         After a session, run `dream idle` once the agent has been idle for 45 to 60\n\
+         minutes, and `dream nightly` once a night.\n\n\
          Heartbeat (for the harness; Mnem runs no daemon)\n\
          \x20 next                     when to wake the agent next: YYYY-MM-DDTHH:MM, or none\n\
          \x20 due                      what is due now, one nudge line each\n\
@@ -303,8 +316,10 @@ fn setup_block(me: &str, dir: &str, chars: usize) -> String {
         "## Memory (Mnem)\n\n\
          You keep a persistent notebook with `{me}`. Its files are in `{dir}`,\n\
          and only the tool changes them.\n\n\
-         1. Begin each session with `{me} wake`. Read all it prints and follow\n\
-         \x20  its instructions, part by part, until a part ends with \"You are awake.\"\n\
+         1. Begin each session with `{me} session start`, unless your harness runs it\n\
+         \x20  for you. It shows what you know (MIND.md), anything due, and then your\n\
+         \x20  notebook. Read all it prints and follow its instructions, part by part,\n\
+         \x20  until a part ends with \"You are awake.\"\n\
          2. Record what is worth remembering across sessions (decisions, facts about\n\
          \x20  the user or the project, results of substantial work, mistakes to avoid)\n\
          \x20  with `{me} note \"<single line, at most {chars} bytes>\"`. Do not repeat\n\
@@ -1254,6 +1269,19 @@ fn brief(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
             due
         }
     };
+    upcoming_section(&agenda, now, &mut out);
+    fired::record(
+        &held,
+        notebook.dir(),
+        &heartbeat::handed(&handed),
+        now,
+        |entry| agenda.still_needed(entry, now),
+    )?;
+    Ok(Reply::done(&out))
+}
+
+/// What is due in the next hours, if anything, added to `out`.
+fn upcoming_section(agenda: &Agenda, now: DateTime, out: &mut Vec<String>) {
     let upcoming = agenda.upcoming(now);
     if !upcoming.is_empty() {
         out.push(String::new());
@@ -1263,14 +1291,54 @@ fn brief(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
         ));
         out.extend(heartbeat::upcoming_lines(&upcoming));
     }
-    fired::record(
-        &held,
-        notebook.dir(),
-        &heartbeat::handed(&handed),
-        now,
-        |entry| agenda.still_needed(entry, now),
-    )?;
-    Ok(Reply::done(&out))
+}
+
+fn session(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
+    match args {
+        ["start"] => {
+            // Wake first: if it fails, nothing is recorded as handed over.
+            let woken = wake(context, notebook, &[])?;
+            let mut out = Vec::new();
+            let held = fired::hold(notebook.dir())?;
+            let agenda = Agenda::read(notebook)?;
+            let handed = session_brief(context, notebook, &agenda, &mut out)?;
+            upcoming_section(&agenda, context.now, &mut out);
+            fired::record(
+                &held,
+                notebook.dir(),
+                &heartbeat::handed(&handed),
+                context.now,
+                |entry| agenda.still_needed(entry, context.now),
+            )?;
+            drop(held);
+            out.push(String::new());
+            out.push("Your notebook:".to_owned());
+            let mut reply = Reply::done(&out);
+            reply.stdout.push_str(&woken.stdout);
+            reply.stderr = woken.stderr;
+            reply.compact = woken.compact;
+            // A wake that asks for summaries first still exits 0 here: the
+            // brief above was handed over, and hooks that see a failure may
+            // drop the output. The request itself says what to do.
+            Ok(reply)
+        }
+        ["compact"] => {
+            if context.model.is_none() {
+                return Ok(Reply::done(&[
+                    "No model program is set in MNEM_MODEL, so there is nothing to dream."
+                        .to_owned(),
+                ]));
+            }
+            let mut reply = Reply::done(&[format!(
+                "Dreaming in the background before compaction ({} dream compact); see {}.",
+                context.me,
+                dream::LOG
+            )]);
+            reply.dream = true;
+            Ok(reply)
+        }
+        _ => Err(usage_error(context, "session start | session compact")),
+    }
 }
 
 /// The session brief's lines, added to `out`; returns what it hands over.
@@ -2342,6 +2410,85 @@ mod tests {
             "Recorded 1 nudge as fired at 2026-10-31T09:00.\n\
              No current nudge or reminder has the id nope; check for a typo.\n",
             "repeats are counted once, and unknown ids are pointed out"
+        );
+    }
+
+    #[test]
+    fn a_session_starts_with_what_is_known_then_wakes() {
+        let scratch = Scratch::new();
+        let context = notebook_with(&scratch, 2);
+        let first = ok(&context, &["session", "start"]);
+        assert!(
+            first.starts_with(
+                "Session start, 2026-10-31T09:00.\n\nNo MIND.md yet: Dream has not run.\n"
+            ),
+            "before any dream: {first}"
+        );
+        fs::write(
+            scratch.path.join("MIND.md"),
+            "## Durable\n- Counts notes (#0)\n## Active\n## Hunches\n## Nudges\n\
+             - hello | next session | - | Say hello | First notes (#1) | notify\n",
+        )
+        .expect("write MIND.md");
+        let second = ok(&context, &["session", "start"]);
+        for part in [
+            "What you know (from MIND.md):\nDurable:\n- Counts notes (#0)\n",
+            "1. Say hello (tell the user)\n",
+            "Your notebook:\n#0 2026-10-31 note 0\n#1 2026-10-31 note 1\nYou are awake.\n",
+        ] {
+            assert!(
+                second.contains(part),
+                "the session start has {part:?}: {second}"
+            );
+        }
+        assert!(
+            !ok(&context, &["session", "start"]).contains("Say hello"),
+            "a next-session nudge opens one session only"
+        );
+        assert_eq!(
+            run(&context, &["session", "compact"]),
+            Reply::done(&[
+                "No model program is set in MNEM_MODEL, so there is nothing to dream.".to_owned()
+            ]),
+            "without a model there is no dream to start"
+        );
+        let compact = run(
+            &with_summarizer(&scratch, "unused"),
+            &["session", "compact"],
+        );
+        assert!(
+            compact.dream && !compact.compact,
+            "with one, compaction starts a dream in the background, nothing else"
+        );
+        ok(&context, &["note", "note 2"]);
+        ok(&context, &["note", "note 3"]);
+        ok(&context, &["config", "WAKE_LINES=1"]);
+        fs::write(
+            scratch.path.join("MIND.md"),
+            "## Durable\n## Active\n## Hunches\n## Nudges\n\
+             - again | next session | - | Say hello again | First notes (#1) | notify\n",
+        )
+        .expect("write MIND.md");
+        let refused = run(&context, &["session", "start"]);
+        assert_eq!(
+            refused.code, 0,
+            "the brief was handed over, so the hook sees success"
+        );
+        assert!(
+            refused.stdout.contains("1. Say hello again")
+                && refused.stdout.contains("Your notebook:\nCannot wake yet"),
+            "the brief, then wake's request for summaries: {}",
+            refused.stdout
+        );
+        assert!(
+            fs::read_to_string(scratch.path.join("fired.log"))
+                .is_ok_and(|ledger| ledger.contains("again ")),
+            "what was shown is recorded"
+        );
+        assert!(
+            fails(&context, &["session", "end"])
+                .contains("usage: mnem session start | session compact"),
+            "only two entry points"
         );
     }
 
