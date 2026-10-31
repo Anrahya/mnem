@@ -8,6 +8,11 @@ publish = false
 
 [dependencies]
 
+# Keep build output small: backtraces still show file and line, but the full
+# debug info, the bulk of target/, is not written.
+[profile.dev]
+debug = "line-tables-only"
+
 # Lint policy: rust-anti-slop baseline plus the profiles that fit Mnem.
 # Mnem is a single-threaded CLI with no async, and it parses and writes
 # fixed-width storage records, so the numeric and indexing profile applies.

@@ -67,14 +67,33 @@ mod harness {
             .expect("memo runs")
     }
 
-    /// A fresh, empty directory for one test.
-    pub(crate) fn scratch(name: &str) -> PathBuf {
-        let dir = env::temp_dir().join(format!("mnem-compat-{}-{name}", std::process::id()));
-        if dir.exists() {
-            fs::remove_dir_all(&dir).expect("old scratch directory is removable");
+    /// A fresh, empty directory for one test, deleted when the value is
+    /// dropped: after the test passes, and also when an assertion fails.
+    pub(crate) struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        pub(crate) fn path(&self) -> &Path {
+            &self.path
         }
-        fs::create_dir_all(&dir).expect("scratch directory is creatable");
-        dir
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // Drop cannot report an error, and panicking here during a failed
+            // test would abort the run; at worst one temp folder is left.
+            drop(fs::remove_dir_all(&self.path));
+        }
+    }
+
+    pub(crate) fn scratch(name: &str) -> Scratch {
+        let path = env::temp_dir().join(format!("mnem-compat-{}-{name}", std::process::id()));
+        if path.exists() {
+            fs::remove_dir_all(&path).expect("old scratch directory is removable");
+        }
+        fs::create_dir_all(&path).expect("scratch directory is creatable");
+        Scratch { path }
     }
 
     pub(crate) fn text(raw: &str) -> Text {
@@ -110,7 +129,7 @@ fn cover_matches_memo() {
 #[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
 fn records_match_memo() {
     let dir = harness::scratch("records");
-    let memory = dir.join("memory");
+    let memory = dir.path().join("memory");
     assert!(
         harness::run_memo(&memory, &["init"]).status.success(),
         "memo init"
@@ -191,7 +210,6 @@ fn records_match_memo() {
         u64::try_from(log.len()).expect("fits"),
         "rejected notes leave no record"
     );
-    fs::remove_dir_all(&dir).expect("scratch directory is removable");
 }
 
 #[test]

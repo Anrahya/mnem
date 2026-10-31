@@ -23,6 +23,13 @@ which need a checkout of OptMem and `python3`:
 OPTMEM_MEMO=/path/to/OptMem/memo cargo test --test optmem_compat -- --ignored
 ```
 
+## Disk space
+
+This machine is short on disk. Build only into this repo's `target/`; never
+set `CARGO_TARGET_DIR` to a second location, and tell subagents the same.
+Delete scratch builds and temporary folders as soon as their work is done.
+`cargo clean` reclaims `target/` when it grows.
+
 ## How to write Rust here
 
 Follow the `rust-anti-slop` skill. Its lint policy is in `Cargo.toml` and
