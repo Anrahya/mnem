@@ -66,4 +66,6 @@ On top of that skill, these rules come from Google's Rust style guide:
 - **Model calls** go through the `Model` seam in `src/model.rs`: the harness
   names a program (`MNEM_MODEL`; prompt on stdin, reply on stdout, exit
   3 to decline), and Mnem has no model of its own or any provider's API. They happen only in the compactor and Dream, and code
-  validates everything they return before it touches disk.
+  validates everything they return before it touches disk. A harness that
+  embeds Mnem as a library (`src/memory.rs`) gets the same work as job/apply
+  pairs instead and calls its own model; the library never calls one.

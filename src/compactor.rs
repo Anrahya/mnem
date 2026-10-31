@@ -19,6 +19,7 @@ use std::fs::TryLockError;
 use std::io;
 use std::path::Path;
 
+use crate::files;
 use crate::model::Answer;
 use crate::model::Job;
 use crate::model::Model;
@@ -27,6 +28,7 @@ use crate::notebook::Notebook;
 use crate::notebook::NotebookError;
 use crate::notebook::PutOutcome;
 use crate::notebook::RAW_MAX;
+use crate::simhash;
 use crate::span::Span;
 use crate::text::Text;
 use crate::text::TextError;
@@ -41,6 +43,9 @@ const CONTEXT_NOTES: u64 = 64;
 
 /// The file that records why the last run stopped, while it is unresolved.
 const FAILED: &str = ".compact.failed";
+
+/// The file that keeps the tries at the summary being written; see [`Tries`].
+const JOB: &str = ".compact.job";
 
 /// How a summary was written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -149,11 +154,121 @@ fn write_due(
     model: &mut dyn Model,
     report: &mut Report,
 ) -> Result<(), NotebookError> {
-    let limit = notebook.config().entry_chars();
     loop {
-        let notes = notebook.len()?;
-        let Some(&block) = notebook.pending(notes, Some(1))?.first() else {
-            return Ok(());
+        let mut job = match next_job(notebook)? {
+            Next::Done => return Ok(()),
+            Next::Blank { block, half } => {
+                report.stopped = Some(Stop::BlankHalf { block, half });
+                return Ok(());
+            }
+            Next::Job(job) => job,
+        };
+        loop {
+            let answer = match model.ask(Job::Summary, &job.prompt) {
+                Ok(answer) => answer,
+                Err(unavailable) => {
+                    report.stopped = Some(Stop::Unavailable(unavailable));
+                    return Ok(());
+                }
+            };
+            match apply(notebook, &job.id, answer) {
+                Ok(Applied::Saved(how)) => {
+                    report.written.push((job.id.block, how));
+                    break;
+                }
+                Ok(Applied::Retry(next)) => job = next,
+                // Another writer settled or forgot the block, or one of its
+                // halves, meanwhile; the next pass starts from what is due now.
+                Ok(Applied::Settled) | Err(ApplyError::Stale(_)) => break,
+                Err(ApplyError::Invalid(why)) => {
+                    report.stopped = Some(Stop::Unavailable(Unavailable(why)));
+                    return Ok(());
+                }
+                Err(ApplyError::Notebook(error)) => return Err(error),
+            }
+        }
+    }
+}
+
+/// Which try at which summary a model's answer is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SummaryId {
+    /// The block the summary stands in for.
+    pub block: Span,
+    /// The try, from 0; tries after the first follow a line that was too long.
+    pub attempt: usize,
+    /// A digest of the block's input, so an answer about input that changed
+    /// meanwhile is refused.
+    pub digest: u64,
+}
+
+/// One summary to ask a model for: send it `prompt`, then pass the answer to
+/// [`apply`] with `id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SummaryJob {
+    /// What the answer is for.
+    pub id: SummaryId,
+    /// The prompt to send.
+    pub prompt: String,
+}
+
+/// What is due next; see [`next_job`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Next {
+    /// No summary is due.
+    Done,
+    /// The next summary is due.
+    Job(SummaryJob),
+    /// The next block is built from a half whose summary is stored blank, so
+    /// it cannot be written.
+    Blank { block: Span, half: Span },
+}
+
+/// What [`apply`] did with an answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Applied {
+    /// The summary was saved.
+    Saved(Written),
+    /// Nothing more to do for this job: the summary was saved already (by
+    /// another writer, or by this answer retried), or the block changed
+    /// while it was being written and is due again with new input.
+    Settled,
+    /// The line was too long: ask again with this job.
+    Retry(SummaryJob),
+}
+
+/// Why [`apply`] refused an answer. Nothing was written.
+#[derive(Debug)]
+pub enum ApplyError {
+    /// The job is no longer current: the block, its input or its try moved
+    /// on. Ask [`next_job`] again.
+    Stale(String),
+    /// The answer cannot be a summary.
+    Invalid(String),
+    /// The notebook could not be read or written.
+    Notebook(NotebookError),
+}
+
+impl From<NotebookError> for ApplyError {
+    fn from(error: NotebookError) -> Self {
+        Self::Notebook(error)
+    }
+}
+
+/// The tries so far at one summary, kept in [`JOB`] between a job and its
+/// answer: the shortest line too long to keep, and the last one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Tries {
+    id: SummaryId,
+    shortest: Option<String>,
+    last: Option<String>,
+}
+
+/// The next summary due, smallest block first.
+pub fn next_job(notebook: &Notebook) -> Result<Next, NotebookError> {
+    loop {
+        let Some(&block) = notebook.pending(notebook.len()?, Some(1))?.first() else {
+            return Ok(Next::Done);
         };
         let input = match Input::read(notebook, block)? {
             Ok(input) => input,
@@ -161,25 +276,185 @@ fn write_due(
                 // A half that was just forgotten is due again and comes
                 // first; only a half still in place is truly blank.
                 if notebook.pending(notebook.len()?, Some(1))?.first() == Some(&block) {
-                    report.stopped = Some(Stop::BlankHalf { block, half });
-                    return Ok(());
+                    return Ok(Next::Blank { block, half });
                 }
                 continue;
             }
         };
-        let (text, how) = match summarize(model, block, &input, limit) {
-            Ok(written) => written,
-            Err(unavailable) => {
-                report.stopped = Some(Stop::Unavailable(unavailable));
-                return Ok(());
+        let tries = current_tries(notebook.dir(), block, &input)?;
+        let prompt = prompt(
+            block,
+            &input,
+            notebook.config().entry_chars(),
+            tries.last.as_deref(),
+        );
+        return Ok(Next::Job(SummaryJob {
+            id: tries.id,
+            prompt,
+        }));
+    }
+}
+
+/// Saves the summary `answer` gives for the job `id`, or asks again.
+///
+/// Keeping the shortest of the tries and cutting the input when the model
+/// declines follow UniiChat's `Memory.build` (Victor Taelin,
+/// github.com/VictorTaelin/uniichat, Apache-2.0), adapted.
+pub fn apply(notebook: &Notebook, id: &SummaryId, answer: Answer) -> Result<Applied, ApplyError> {
+    let block = id.block;
+    if notebook.summary(block)?.is_some() {
+        return Ok(Applied::Settled);
+    }
+    if notebook.pending(notebook.len()?, Some(1))?.first() != Some(&block) {
+        return Err(ApplyError::Stale(format!(
+            "#{block} is not the next summary due"
+        )));
+    }
+    let input = match Input::read(notebook, block)? {
+        Ok(input) => input,
+        Err(half) => {
+            return Err(ApplyError::Stale(format!(
+                "#{half}, which #{block} is built from, has no summary now"
+            )));
+        }
+    };
+    let mut tries = current_tries(notebook.dir(), block, &input)?;
+    if tries.id != *id {
+        return Err(ApplyError::Stale(format!(
+            "{}; ask for the current job",
+            if tries.id.digest == id.digest {
+                format!(
+                    "this answer is for try {} at #{block}, but try {} is current",
+                    id.attempt, tries.id.attempt
+                )
+            } else {
+                format!("the input of #{block} changed after this job was made")
             }
-        };
-        // `NotNext` means another writer settled or forgot the block, or one
-        // of its halves, meanwhile; the next pass starts from what is due now.
-        if notebook.put_summary_over(block, &text, &input.sources)? == PutOutcome::Saved {
-            report.written.push((block, how));
+        )));
+    }
+    let limit = notebook.config().entry_chars();
+    let line = match answer {
+        Answer::Declined => None,
+        Answer::Reply(reply) => {
+            if reply.contains(&"-".repeat(limit)) || reply.contains("\n<input>\n") {
+                return Err(ApplyError::Invalid(
+                    "the reply repeats the prompt: is the summarizer a model?".to_owned(),
+                ));
+            }
+            Some(one_line(&reply))
+        }
+    };
+    if let Some(line) = line {
+        match Text::try_new(&line, limit) {
+            Ok(text) => return save(notebook, block, &text, &input, Written::ByModel),
+            Err(TextError::TooLong { .. } | TextError::MultiLine { .. }) => {
+                if tries
+                    .shortest
+                    .as_ref()
+                    .is_none_or(|kept| line.len() < kept.len())
+                {
+                    tries.shortest = Some(line.clone());
+                }
+                if tries.id.attempt < RETRIES {
+                    tries.id.attempt = tries.id.attempt.saturating_add(1);
+                    tries.last = Some(line);
+                    write_tries(notebook.dir(), &tries)?;
+                    let prompt = prompt(block, &input, limit, tries.last.as_deref());
+                    return Ok(Applied::Retry(SummaryJob {
+                        id: tries.id,
+                        prompt,
+                    }));
+                }
+            }
+            Err(TextError::Empty) => {}
         }
     }
+    let (source, how) = match tries.shortest {
+        Some(line) => (line, Written::CutReply),
+        None => (input.texts.join("; "), Written::CutInput),
+    };
+    save(notebook, block, &Text::cut(&source, limit), &input, how)
+}
+
+/// Saves `text` as the summary of `block`, built from `input`.
+fn save(
+    notebook: &Notebook,
+    block: Span,
+    text: &Text,
+    input: &Input,
+    how: Written,
+) -> Result<Applied, ApplyError> {
+    Ok(
+        match notebook.put_summary_over(block, text, &input.sources)? {
+            PutOutcome::Saved => {
+                files::remove(&notebook.dir().join(JOB))?;
+                Applied::Saved(how)
+            }
+            // The tries kept are for this block's old input, so the next job
+            // ignores them.
+            PutOutcome::NotNext => Applied::Settled,
+        },
+    )
+}
+
+/// The tries kept for `block` with this `input`, or a first try.
+fn current_tries(dir: &Path, block: Span, input: &Input) -> Result<Tries, NotebookError> {
+    let digest = input.digest();
+    let fresh = Tries {
+        id: SummaryId {
+            block,
+            attempt: 0,
+            digest,
+        },
+        shortest: None,
+        last: None,
+    };
+    let path = dir.join(JOB);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(fresh),
+        Err(source) => return Err(NotebookError::Io { path, source }),
+    };
+    // A torn or foreign file only costs the tries so far.
+    Ok(read_tries(&text)
+        .filter(|kept| kept.id.block == block && kept.id.digest == digest)
+        .unwrap_or(fresh))
+}
+
+/// [`Tries`] from [`JOB`]: `<block> <attempt> <digest>`, then the shortest
+/// line and the last line, each empty when there is none.
+fn read_tries(text: &str) -> Option<Tries> {
+    let mut lines = text.split('\n');
+    let mut head = lines.next()?.split(' ');
+    let block = Span::parse_block(head.next()?).ok()?;
+    let attempt = head.next()?.parse::<usize>().ok()?;
+    let digest = u64::from_str_radix(head.next()?, 16).ok()?;
+    let line = |raw: &str| (!raw.is_empty()).then(|| raw.to_owned());
+    let shortest = line(lines.next()?);
+    let last = line(lines.next()?);
+    Some(Tries {
+        id: SummaryId {
+            block,
+            attempt,
+            digest,
+        },
+        shortest,
+        last,
+    })
+}
+
+fn write_tries(dir: &Path, tries: &Tries) -> Result<(), NotebookError> {
+    files::replace(
+        &dir.join(JOB),
+        &format!(
+            "{} {} {:016x}\n{}\n{}\n",
+            tries.id.block,
+            tries.id.attempt,
+            tries.id.digest,
+            tries.shortest.as_deref().unwrap_or_default(),
+            tries.last.as_deref().unwrap_or_default()
+        ),
+    )
 }
 
 /// What a block is summarized from. `nap` shows the agent the same input.
@@ -196,6 +471,17 @@ pub(crate) struct Input {
 }
 
 impl Input {
+    /// A digest of what the model is shown: FNV-1a over the input and
+    /// context lines, stable across runs and builds.
+    fn digest(&self) -> u64 {
+        let mut shown = String::new();
+        for line in self.lines.iter().chain(&self.context) {
+            shown.push_str(line);
+            shown.push('\n');
+        }
+        simhash::fnv1a(&shown)
+    }
+
     /// The block's input, or the half whose summary is missing or blank.
     pub(crate) fn read(
         notebook: &Notebook,
@@ -231,51 +517,6 @@ impl Input {
         }
         Ok(Ok(input))
     }
-}
-
-/// One summary line for `block`, and how it was made.
-///
-/// Keeping the shortest of the tries and cutting the input when the model
-/// declines follow UniiChat's `Memory.build` (Victor Taelin,
-/// github.com/VictorTaelin/uniichat, Apache-2.0), adapted.
-fn summarize(
-    model: &mut dyn Model,
-    block: Span,
-    input: &Input,
-    limit: usize,
-) -> Result<(Text, Written), Unavailable> {
-    let ruler = "-".repeat(limit);
-    let mut shortest: Option<String> = None;
-    let mut too_long: Option<String> = None;
-    for _ in 0..=RETRIES {
-        let asked = prompt(block, input, limit, too_long.as_deref());
-        let line = match model.ask(Job::Summary, &asked)? {
-            Answer::Reply(reply) => {
-                if reply.contains(&ruler) || reply.contains("\n<input>\n") {
-                    return Err(Unavailable(
-                        "the reply repeats the prompt: is the summarizer a model?".to_owned(),
-                    ));
-                }
-                one_line(&reply)
-            }
-            Answer::Declined => break,
-        };
-        match Text::try_new(&line, limit) {
-            Ok(text) => return Ok((text, Written::ByModel)),
-            Err(TextError::TooLong { .. } | TextError::MultiLine { .. }) => {
-                if shortest.as_ref().is_none_or(|kept| line.len() < kept.len()) {
-                    shortest = Some(line.clone());
-                }
-                too_long = Some(line);
-            }
-            Err(TextError::Empty) => break,
-        }
-    }
-    let (source, how) = match shortest {
-        Some(line) => (line, Written::CutReply),
-        None => (input.texts.join("; "), Written::CutInput),
-    };
-    Ok((Text::cut(&source, limit), how))
 }
 
 /// The reply as a single line: each line break, `\r` included, and the space

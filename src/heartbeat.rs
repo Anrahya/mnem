@@ -155,6 +155,30 @@ impl Agenda {
         found
     }
 
+    /// Every timed item not yet fired or stale, earliest first, overdue
+    /// ones included.
+    pub fn timed(&self, now: DateTime) -> Vec<&Nudge> {
+        let mut found = Vec::new();
+        for item in &self.items {
+            if matches!(item.when, When::At(_)) && self.live(item, now) {
+                found.push(item);
+            }
+        }
+        found.sort_by_key(|item| when_key(item));
+        found
+    }
+
+    /// Every item waiting for an event, not yet fired or stale.
+    pub fn waiting(&self, now: DateTime) -> Vec<&Nudge> {
+        let mut found = Vec::new();
+        for item in &self.items {
+            if matches!(item.when, When::Event(_)) && self.live(item, now) {
+                found.push(item);
+            }
+        }
+        found
+    }
+
     /// Nudges for the start of the next session.
     pub fn for_session(&self, now: DateTime) -> Vec<&Nudge> {
         let mut found = Vec::new();
