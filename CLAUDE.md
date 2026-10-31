@@ -1,7 +1,7 @@
 # Mnem
 
 Memory for proactive agents, in Rust. The design is the spec at
-https://claude.ai/artifact/5VHSbkX5WpDaiS3PHd2xJT (draft 4). Read the part
+https://claude.ai/artifact/5VHSbkX5WpDaiS3PHd2xJT (draft 5). Read the part
 you are building before writing code; when code and spec disagree, raise it
 instead of silently picking one.
 
