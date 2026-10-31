@@ -33,15 +33,21 @@ fn main() -> ExitCode {
         Ok(context) => context,
         Err(message) => return emit(&Reply::failed(&message)),
     };
-    let reply = cli::run(&context, &rest);
-    let code = emit(&reply);
-    if reply.compact {
-        start_background(&context, &["compact"]);
+    let mut reply = cli::run(&context, &rest);
+    // Start background work before the reply goes out, so a failed start
+    // can be reported with it.
+    if reply.compact && !start_background(&context, &["compact"]) {
+        reply
+            .stderr
+            .push_str("Could not start the summarizer; due summaries stay due.\n");
     }
-    if reply.dream {
-        start_background(&context, &["dream", "compact"]);
+    if reply.dream && !start_background(&context, &["dream", "compact"]) {
+        reply.stderr.push_str(&format!(
+            "Could not start the background dream; run {} dream compact.\n",
+            context.me
+        ));
     }
-    code
+    emit(&reply)
 }
 
 fn context(program: Option<PathBuf>) -> Result<Context, String> {
@@ -77,9 +83,9 @@ fn today(date: Date) -> Result<Day, String> {
 /// lands when the model is done. If the start fails, nothing is lost: due
 /// summaries stay due, and `wake` asks the agent for any it needs, and the
 /// next dream reads the notes this one would have.
-fn start_background(context: &Context, args: &[&str]) {
+fn start_background(context: &Context, args: &[&str]) -> bool {
     let Ok(program) = env::current_exe() else {
-        return;
+        return false;
     };
     let mut command = Command::new(program);
     command
@@ -92,7 +98,7 @@ fn start_background(context: &Context, args: &[&str]) {
     // command does not stop it.
     #[cfg(unix)]
     command.process_group(0);
-    drop(command.spawn());
+    command.spawn().is_ok()
 }
 
 /// The only place Mnem writes to the terminal. It writes through `io::Write`

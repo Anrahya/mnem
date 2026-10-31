@@ -649,6 +649,8 @@ fn io_error(path: &Path, source: io::Error) -> NotebookError {
 mod tests {
     use std::fs;
     use std::fs::OpenOptions;
+    use std::thread;
+    use std::time::Duration;
 
     use jiff::civil::DateTime;
 
@@ -662,6 +664,7 @@ mod tests {
     use crate::model::Model;
     use crate::model::Unavailable;
     use crate::notebook::Notebook;
+    use crate::notebook::NotebookError;
     use crate::tags;
     use crate::testing::Scratch;
     use crate::text::Text;
@@ -710,6 +713,30 @@ mod tests {
         notebook.append(&batch).expect("notes are saved");
     }
 
+    /// [`dream::run`], tried again while it reports [`Outcome::Busy`]. Tests
+    /// run in parallel threads, and a model program another test is
+    /// starting can hold a copy of this test's lock for the moment between
+    /// its fork and its exec.
+    fn run_dream(
+        notebook: &Notebook,
+        mut model: Option<&mut (dyn Model + 'static)>,
+        trigger: Trigger,
+        now: DateTime,
+    ) -> Result<Outcome, NotebookError> {
+        for _ in 0..100 {
+            let reborrowed: Option<&mut dyn Model> = match &mut model {
+                Some(model) => Some(&mut **model),
+                None => None,
+            };
+            let outcome = dream::run(notebook, reborrowed, trigger, now)?;
+            if outcome != Outcome::Busy {
+                return Ok(outcome);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        Ok(Outcome::Busy)
+    }
+
     const NOTES: [(&str, &str); 5] = [
         ("2026-10-28", "Lives in Mumbai"),
         ("2026-10-29", "Skipped breakfast, early meeting"),
@@ -735,7 +762,7 @@ mod tests {
         let scratch = Scratch::new();
         let notebook = notebook(&scratch, &NOTES);
         let mut model = Scripted::replying(REPLY);
-        let outcome = dream::run(&notebook, Some(&mut model), Trigger::Nightly, now())
+        let outcome = run_dream(&notebook, Some(&mut model), Trigger::Nightly, now())
             .expect("the dream runs");
         assert_eq!(
             outcome,
@@ -788,9 +815,9 @@ mod tests {
         let scratch = Scratch::new();
         let notebook = notebook(&scratch, &NOTES);
         let mut model = Scripted::replying(REPLY);
-        dream::run(&notebook, Some(&mut model), Trigger::Nightly, now()).expect("first");
+        run_dream(&notebook, Some(&mut model), Trigger::Nightly, now()).expect("first");
         add(&notebook, &[("2026-10-31", "Ate the omelette")]);
-        let tidied = dream::run(&notebook, Some(&mut model), Trigger::Idle, now()).expect("idle");
+        let tidied = run_dream(&notebook, Some(&mut model), Trigger::Idle, now()).expect("idle");
         assert_eq!(
             tidied,
             Outcome::Tidied { new: 1, dropped: 0 },
@@ -798,7 +825,7 @@ mod tests {
         );
         assert_eq!(model.prompts.len(), 1, "no model call");
         let outcome =
-            dream::run(&notebook, Some(&mut model), Trigger::Compact, now()).expect("compact");
+            run_dream(&notebook, Some(&mut model), Trigger::Compact, now()).expect("compact");
         assert!(
             matches!(
                 outcome,
@@ -822,7 +849,7 @@ mod tests {
     fn a_failed_dream_changes_nothing() {
         let scratch = Scratch::new();
         let notebook = notebook(&scratch, &NOTES);
-        dream::run(
+        run_dream(
             &notebook,
             Some(&mut Scripted::replying(REPLY)),
             Trigger::Nightly,
@@ -858,7 +885,7 @@ mod tests {
         ];
         let failures = scratch.path.join(".dream.rejected");
         for (reply, why) in cases {
-            let outcome = dream::run(
+            let outcome = run_dream(
                 &notebook,
                 Some(&mut Scripted::replying(&reply)),
                 Trigger::Nightly,
@@ -877,7 +904,7 @@ mod tests {
             prompts: Vec::new(),
         };
         assert_eq!(
-            dream::run(&notebook, Some(&mut unavailable), Trigger::Nightly, now()).ok(),
+            run_dream(&notebook, Some(&mut unavailable), Trigger::Nightly, now()).ok(),
             Some(Outcome::Unavailable("timed out".to_owned())),
             "an unreachable model"
         );
@@ -898,7 +925,7 @@ mod tests {
         for _ in 0..dream::FAILURES_MAX {
             let mut model = Scripted::replying("no draft today");
             outcomes.push(
-                dream::run(&notebook, Some(&mut model), Trigger::Nightly, now())
+                run_dream(&notebook, Some(&mut model), Trigger::Nightly, now())
                     .expect("the run completes"),
             );
         }
@@ -928,7 +955,7 @@ mod tests {
         ));
         let notebook = notebook(&scratch, &notes);
         let mut model = Scripted::replying(REPLY);
-        dream::run(&notebook, Some(&mut model), Trigger::Nightly, now()).expect("the dream runs");
+        run_dream(&notebook, Some(&mut model), Trigger::Nightly, now()).expect("the dream runs");
         let prompt = model.prompts.first().expect("one call");
         assert_eq!(
             prompt.matches("</new-notes>").count(),
@@ -953,7 +980,7 @@ mod tests {
                     ## Nudges\n- old | 2026-10-30T08:00 | 09:00 | Make tea | Likes tea (#4) | notify\n";
         fs::write(scratch.path.join(mind::FILE), text).expect("write");
         assert_eq!(
-            dream::run(&notebook, None, Trigger::Nightly, now()).ok(),
+            run_dream(&notebook, None, Trigger::Nightly, now()).ok(),
             Some(Outcome::Tidied { new: 5, dropped: 0 }),
             "nothing is expired"
         );
@@ -968,7 +995,7 @@ mod tests {
     fn without_a_model_old_lines_still_expire() {
         let scratch = Scratch::new();
         let notebook = notebook(&scratch, &NOTES);
-        dream::run(
+        run_dream(
             &notebook,
             Some(&mut Scripted::replying(REPLY)),
             Trigger::Nightly,
@@ -977,7 +1004,7 @@ mod tests {
         .expect("first");
         let later = tags::date_time("2026-10-31T11:00").expect("a valid time");
         assert_eq!(
-            dream::run(&notebook, None, Trigger::Nightly, later).ok(),
+            run_dream(&notebook, None, Trigger::Nightly, later).ok(),
             Some(Outcome::Tidied { new: 0, dropped: 1 }),
             "the omelette nudge went stale at 10:00"
         );

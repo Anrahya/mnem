@@ -136,6 +136,7 @@ fn session_compact_dreams_in_the_background() {
         &model,
         "cat > /dev/null\n\
          if [ \"$MNEM_JOB\" = dream ]; then\n\
+         sleep 1\n\
          printf '<reflection>Tea twice.</reflection>\\n<mind>\\n## Durable\\n- Drinks green tea (#0, #1)\\n## Active\\n## Hunches\\n## Nudges\\n</mind>\\n'\n\
          else echo \"a summary\"; fi",
     );
@@ -145,7 +146,11 @@ fn session_compact_dreams_in_the_background() {
     let output = harness::mnem(&dir, &model, &["session", "compact"]);
     assert!(
         String::from_utf8_lossy(&output.stdout).starts_with("Dreaming in the background"),
-        "the hook returns at once"
+        "the hook says it is dreaming"
+    );
+    assert!(
+        !dir.join("dream.watermark").exists(),
+        "and returns before the one-second dream is done"
     );
     let deadline = Instant::now() + Duration::from_secs(20);
     while !dir.join("dream.watermark").exists() {
@@ -162,4 +167,21 @@ fn session_compact_dreams_in_the_background() {
         "the next session starts with what the dream learned: {said}"
     );
     assert!(said.ends_with("You are awake.\n"), "and then wakes: {said}");
+    // Let every background run finish, so the scratch folder can go.
+    for (args, done) in [
+        (["dream", "compact"], "No dream"),
+        (["compact", ""], "Nothing left to summarize."),
+    ] {
+        let args: Vec<&str> = args.into_iter().filter(|arg| !arg.is_empty()).collect();
+        loop {
+            let report = harness::mnem(&dir, &model, &args);
+            let said = String::from_utf8_lossy(&report.stdout).into_owned();
+            if said.starts_with(done) {
+                break;
+            }
+            assert!(said.contains("already running"), "only busy: {said}");
+            assert!(Instant::now() < deadline, "the background runs finish");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
