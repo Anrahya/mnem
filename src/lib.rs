@@ -9,10 +9,13 @@ pub mod compactor;
 pub mod config;
 pub mod cover;
 pub mod day;
+pub mod index;
 pub mod model;
 pub mod notebook;
 pub mod record;
+pub mod simhash;
 pub mod span;
+pub mod tags;
 pub mod text;
 
 #[cfg(test)]
