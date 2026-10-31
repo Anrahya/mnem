@@ -126,3 +126,40 @@ fn notes_return_at_once_and_summaries_follow() {
         "no failure was recorded"
     );
 }
+
+#[test]
+fn session_compact_dreams_in_the_background() {
+    let scratch = harness::scratch("dream");
+    let dir = scratch.path.join("nb");
+    let model = scratch.path.join("model.sh");
+    harness::script(
+        &model,
+        "cat > /dev/null\n\
+         if [ \"$MNEM_JOB\" = dream ]; then\n\
+         printf '<reflection>Tea twice.</reflection>\\n<mind>\\n## Durable\\n- Drinks green tea (#0, #1)\\n## Active\\n## Hunches\\n## Nudges\\n</mind>\\n'\n\
+         else echo \"a summary\"; fi",
+    );
+    harness::mnem(&dir, &model, &["init"]);
+    harness::mnem(&dir, &model, &["note", "Had green tea in the morning"]);
+    harness::mnem(&dir, &model, &["note", "Green tea again after lunch"]);
+    let output = harness::mnem(&dir, &model, &["session", "compact"]);
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("Dreaming in the background"),
+        "the hook returns at once"
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !dir.join("dream.watermark").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the background dream finishes within 20 s"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let start = harness::mnem(&dir, &model, &["session", "start"]);
+    let said = String::from_utf8_lossy(&start.stdout);
+    assert!(
+        said.contains("Durable:\n- Drinks green tea (#0, #1)\n"),
+        "the next session starts with what the dream learned: {said}"
+    );
+    assert!(said.ends_with("You are awake.\n"), "and then wakes: {said}");
+}
