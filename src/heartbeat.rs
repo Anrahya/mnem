@@ -1,6 +1,6 @@
 //! The heartbeat's side of memory: what is due, what is next, and the brief
 //! that hands it to the agent. Mnem keeps no daemon; the harness owns the
-//! timer. It asks [`next`] when to wake, wakes the agent with a heartbeat
+//! timer. It asks [`Agenda::next`] when to wake, wakes the agent with a heartbeat
 //! brief at that time, and starts each session with a session brief.
 //!
 //! Two sources feed it: MIND.md's nudges and the `[at …]` reminders in
