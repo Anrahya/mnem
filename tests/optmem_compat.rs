@@ -8,11 +8,23 @@
 //! ```
 
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
+use std::fs::OpenOptions;
+use std::io::BufRead as _;
+use std::io::BufReader;
+use std::io::Write as _;
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use mnem::cover;
 use mnem::day::Day;
+use mnem::notebook::Notebook;
+use mnem::notebook::PutOutcome;
 use mnem::record;
 use mnem::record::LOG_REC;
 use mnem::record::TREE_REC;
@@ -24,12 +36,15 @@ use mnem::text::Text;
 #[cfg(test)]
 mod harness {
     use std::env;
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::Path;
     use std::path::PathBuf;
     use std::process::Command;
     use std::process::Output;
 
+    use mnem::day::Day;
+    use mnem::span::Span;
     use mnem::text::TEXT_MAX;
     use mnem::text::Text;
 
@@ -42,13 +57,26 @@ mod harness {
 
     /// Runs a Python script with `memo` loaded as `m`; returns its stdout.
     pub(crate) fn python(script: &str) -> String {
-        let output = Command::new("python3")
+        python_with(script, &[])
+    }
+
+    /// The command that runs a Python script with `memo` loaded as `m`;
+    /// `args` follow the memo path in `sys.argv`, so the first is
+    /// `sys.argv[2]`.
+    pub(crate) fn python_command(script: &str, args: &[&OsStr]) -> Command {
+        let mut command = Command::new("python3");
+        command
             .arg("-I")
             .arg("-c")
             .arg(format!("{LOAD_MEMO}{script}"))
             .arg(memo_path())
-            .output()
-            .expect("python3 runs");
+            .args(args);
+        command
+    }
+
+    /// Like [`python`], with extra arguments.
+    pub(crate) fn python_with(script: &str, args: &[&OsStr]) -> String {
+        let output = python_command(script, args).output().expect("python3 runs");
         assert!(
             output.status.success(),
             "python failed: {}",
@@ -99,6 +127,65 @@ mod harness {
     pub(crate) fn text(raw: &str) -> Text {
         Text::try_new(raw, TEXT_MAX).expect("test input is valid text")
     }
+
+    /// Copies a notebook: its files and `TREE/` level files.
+    pub(crate) fn copy_notebook(from: &Path, to: &Path) {
+        fs::create_dir_all(to.join("TREE")).expect("target is creatable");
+        for name in ["LOG.txt", ".lock", "config"] {
+            if from.join(name).exists() {
+                fs::copy(from.join(name), to.join(name)).expect("file copies");
+            }
+        }
+        for entry in fs::read_dir(from.join("TREE")).expect("TREE/ is readable") {
+            let entry = entry.expect("entry is readable");
+            fs::copy(entry.path(), to.join("TREE").join(entry.file_name())).expect("level copies");
+        }
+    }
+
+    pub(crate) fn day(raw: &str) -> Day {
+        Day::try_new(raw).expect("a real date")
+    }
+
+    pub(crate) fn block(lo: u64, hi: u64) -> Span {
+        Span::try_new(lo, hi).expect("an aligned block")
+    }
+
+    /// Parses Python's printed `lo hi` lines into blocks.
+    pub(crate) fn blocks_from(printed: &str) -> Vec<Span> {
+        let mut blocks = Vec::new();
+        for line in printed.lines() {
+            let (lo, hi) = line.split_once(' ').expect("a 'lo hi' line");
+            blocks.push(block(
+                lo.parse::<u64>().expect("lo"),
+                hi.parse::<u64>().expect("hi"),
+            ));
+        }
+        blocks
+    }
+
+    /// Every file under `TREE/`, by name, with its bytes.
+    pub(crate) fn tree_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(dir.join("TREE")).expect("TREE/ is readable") {
+            let entry = entry.expect("entry is readable");
+            let name = entry.file_name().to_string_lossy().into_owned();
+            files.push((name, fs::read(entry.path()).expect("level is readable")));
+        }
+        files.sort();
+        files
+    }
+}
+
+/// Python that makes notebook `sys.argv[2]` hold `sys.argv[3]` notes, then
+/// builds the first `sys.argv[4]` due summaries with deterministic text.
+const PY_BUILD: &str = "import os\nd = sys.argv[2]\nos.makedirs(os.path.join(d, 'TREE'), exist_ok=True)\nopen(os.path.join(d, 'LOG.txt'), 'a').close()\nm.log_append(d, [('2026-10-%02d' % (1 + i % 28), 'py note %d é' % i) for i in range(int(sys.argv[3]))])\nT = m.log_len(d)\nfor lo, hi in m.pending(d, T)[:int(sys.argv[4])]:\n    m.tree_put(d, lo, hi, 'py summary %d-%d' % (lo, hi - 1))\n";
+
+/// Builds a notebook at `dir` with Python: `notes` notes, `built` summaries.
+fn py_build(dir: &Path, notes: u64, built: usize) {
+    let notes = notes.to_string();
+    let built = built.to_string();
+    let args = [dir.as_os_str(), OsStr::new(&notes), OsStr::new(&built)];
+    harness::python_with(PY_BUILD, &args);
 }
 
 #[test]
@@ -260,4 +347,295 @@ fn days_match_python_strptime() {
             "{candidate}"
         );
     }
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn memo_reads_what_mnem_writes() {
+    let scratch = harness::scratch("mnem-writes");
+    let dir = scratch.path().join("nb");
+    let notebook = Notebook::init(&dir).expect("init");
+    for i in 0..150_u64 {
+        let note = harness::text(&format!("mnem note {i} \u{1F680}"));
+        notebook
+            .append(&[(harness::day("2026-10-31"), note)])
+            .expect("append");
+    }
+    for due in notebook.pending(150, None).expect("pending") {
+        let summary = harness::text(&format!("mnem summary {due}"));
+        assert_eq!(
+            notebook.put_summary(due, &summary).expect("put"),
+            PutOutcome::Saved,
+            "{due}"
+        );
+    }
+
+    let script = "d = sys.argv[2]\nT = m.log_len(d)\nprint(T, len(m.pending(d, T)))\nfor i in range(T):\n    print('#%d %s %s' % m.log_get(d, i))\nsize = 2\nwhile size <= T:\n    for k in range(T // size):\n        print('%d-%d %s' % (k * size, (k + 1) * size - 1, m.tree_get(d, k * size, (k + 1) * size)))\n    size *= 2\n";
+    let printed = harness::python_with(script, &[dir.as_os_str()]);
+    let mut lines = printed.lines();
+    assert_eq!(
+        lines.next(),
+        Some("150 0"),
+        "memo sees 150 notes and nothing pending"
+    );
+    for i in 0..150 {
+        let want = format!("#{i} 2026-10-31 mnem note {i} \u{1F680}");
+        assert_eq!(lines.next(), Some(want.as_str()), "memo reads note {i}");
+    }
+    let mut summaries = 0;
+    for line in lines {
+        let (id, summary) = line.split_once(' ').expect("an 'id summary' line");
+        assert_eq!(
+            summary,
+            format!("mnem summary {id}"),
+            "memo reads summary {id}"
+        );
+        summaries += 1;
+    }
+    assert_eq!(
+        summaries,
+        75 + 37 + 18 + 9 + 4 + 2 + 1,
+        "every summary of 150 notes was compared"
+    );
+
+    let wake = harness::run_memo(&dir, &["wake"]);
+    let output = String::from_utf8_lossy(&wake.stdout);
+    assert!(wake.status.success(), "memo wake succeeds");
+    assert!(
+        output.contains("You are awake."),
+        "memo wake reads the whole notebook"
+    );
+    assert!(
+        output.contains("mnem summary"),
+        "150 notes overflow wake's budget, so memo reads Mnem's summaries"
+    );
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn mnem_reads_what_memo_writes() {
+    let scratch = harness::scratch("memo-writes");
+    let dir = scratch.path().join("nb");
+    py_build(&dir, 45, 30);
+    let pending = harness::python_with(
+        "d = sys.argv[2]\nfor lo, hi in m.pending(d, m.log_len(d)):\n    print(lo, hi)\n",
+        &[dir.as_os_str()],
+    );
+
+    let notebook = Notebook::open(&dir).expect("open");
+    assert_eq!(notebook.len().expect("len"), 45, "45 notes");
+    for (i, note) in (0_u64..).zip(notebook.scan().expect("scan")) {
+        let note = note.expect("memo's records decode");
+        assert_eq!(note.id, i, "id {i}");
+        assert_eq!(note.text, format!("py note {i} \u{e9}"), "text of note {i}");
+    }
+    let due = notebook.pending(45, None).expect("pending");
+    assert!(!due.is_empty(), "some blocks are left unbuilt");
+    assert_eq!(due, harness::blocks_from(&pending), "same blocks pending");
+    assert_eq!(
+        notebook.pending_count(45).expect("count"),
+        u64::try_from(due.len()).expect("fits"),
+        "count matches the list"
+    );
+    let built = harness::python_with(
+        "d = sys.argv[2]\nT = m.log_len(d)\nfor size in (2, 4, 8, 16, 32):\n    for k in range(T // size):\n        print(k * size, (k + 1) * size, m.tree_get(d, k * size, (k + 1) * size))\n",
+        &[dir.as_os_str()],
+    );
+    for line in built.lines() {
+        let mut fields = line.splitn(3, ' ');
+        let lo = fields
+            .next()
+            .and_then(|f| f.parse::<u64>().ok())
+            .expect("lo");
+        let hi = fields
+            .next()
+            .and_then(|f| f.parse::<u64>().ok())
+            .expect("hi");
+        let want = fields.next().expect("summary or None");
+        let got = notebook.summary(harness::block(lo, hi)).expect("read");
+        assert_eq!(
+            got.as_deref().unwrap_or("None"),
+            want,
+            "summary of {lo}-{}",
+            hi - 1
+        );
+    }
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn forget_matches_memo() {
+    let scratch = harness::scratch("forget");
+    let by_memo = scratch.path().join("by-memo");
+    let by_mnem = scratch.path().join("by-mnem");
+    py_build(&by_memo, 40, 1000);
+    harness::copy_notebook(&by_memo, &by_mnem);
+    let log_before = fs::read(by_mnem.join("LOG.txt")).expect("log");
+
+    let gone = harness::python_with(
+        "for lo, hi in m.tree_drop(sys.argv[2], 8, 16):\n    print(lo, hi)\n",
+        &[by_memo.as_os_str()],
+    );
+    let dropped = Notebook::open(&by_mnem)
+        .expect("open")
+        .forget(harness::block(8, 16))
+        .expect("forget");
+    assert!(
+        !dropped.is_empty(),
+        "forgetting a built block drops something"
+    );
+    assert_eq!(
+        dropped,
+        harness::blocks_from(&gone),
+        "same blocks dropped, same order"
+    );
+    assert_eq!(
+        harness::tree_files(&by_mnem),
+        harness::tree_files(&by_memo),
+        "identical TREE files"
+    );
+    assert_eq!(
+        fs::read(by_mnem.join("LOG.txt")).expect("log"),
+        log_before,
+        "forget leaves the log alone"
+    );
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn crash_repair_matches_memo() {
+    let scratch = harness::scratch("repair");
+    let by_memo = scratch.path().join("by-memo");
+    let by_mnem = scratch.path().join("by-mnem");
+    py_build(&by_memo, 3, 0);
+    let mut log = OpenOptions::new()
+        .append(true)
+        .open(by_memo.join("LOG.txt"))
+        .expect("log opens");
+    log.write_all(b"#3 2026-10-31 cut off mid-wri")
+        .expect("partial write");
+    drop(log);
+    harness::copy_notebook(&by_memo, &by_mnem);
+
+    harness::python_with(
+        "m.log_append(sys.argv[2], [('2026-10-31', 'after the crash')])\n",
+        &[by_memo.as_os_str()],
+    );
+    let id = Notebook::open(&by_mnem)
+        .expect("open")
+        .append(&[(harness::day("2026-10-31"), harness::text("after the crash"))])
+        .expect("append");
+    assert_eq!(id, 3, "the partial record is cut off first");
+    assert_eq!(
+        fs::read(by_mnem.join("LOG.txt")).expect("log"),
+        fs::read(by_memo.join("LOG.txt")).expect("log"),
+        "identical logs after repair"
+    );
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn mnem_and_memo_share_the_write_lock() {
+    let scratch = harness::scratch("lock");
+    let dir = scratch.path().join("nb");
+    Notebook::init(&dir).expect("init");
+    let mut memo_writer = harness::python_command(
+        "for i in range(100):\n    m.log_append(sys.argv[2], [('2026-10-31', 'memo writer %d' % i)])\n",
+        &[dir.as_os_str()],
+    )
+    .spawn()
+    .expect("python starts");
+    let mut writers = Vec::new();
+    for writer in 0..4 {
+        let dir = dir.clone();
+        writers.push(thread::spawn(move || {
+            let notebook = Notebook::open(&dir).expect("open");
+            for i in 0..50 {
+                let note = harness::text(&format!("mnem writer {writer} note {i}"));
+                notebook
+                    .append(&[(harness::day("2026-10-31"), note)])
+                    .expect("append");
+            }
+        }));
+    }
+    for handle in writers {
+        handle.join().expect("writer thread finishes");
+    }
+    assert!(
+        memo_writer.wait().expect("python exits").success(),
+        "memo writer succeeds"
+    );
+
+    let notebook = Notebook::open(&dir).expect("open");
+    let mut count = 0_u64;
+    for (position, note) in (0_u64..).zip(notebook.scan().expect("scan")) {
+        assert_eq!(
+            note.expect("every record is whole").id,
+            position,
+            "ids are unique and in order"
+        );
+        count += 1;
+    }
+    assert_eq!(count, 300, "every note from both tools is there");
+    assert_eq!(
+        fs::metadata(dir.join("LOG.txt")).expect("log").len(),
+        300 * LOG_REC,
+        "no torn writes"
+    );
+}
+
+#[test]
+#[ignore = "runs OptMem's Python memo; set OPTMEM_MEMO"]
+fn mnem_waits_while_memo_holds_the_lock() {
+    let scratch = harness::scratch("lock-held");
+    let dir = scratch.path().join("nb");
+    Notebook::init(&dir).expect("init");
+    let mut holder = harness::python_command(
+        "lock = m.locked(sys.argv[2])\nprint('held', flush=True)\nsys.stdin.readline()\nlock.close()\n",
+        &[dir.as_os_str()],
+    )
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .spawn()
+    .expect("python starts");
+    let mut said = String::new();
+    BufReader::new(holder.stdout.take().expect("piped stdout"))
+        .read_line(&mut said)
+        .expect("python reports the lock");
+    assert_eq!(said.trim(), "held", "memo holds the lock");
+
+    let (done, finished) = mpsc::channel();
+    let writer_dir = dir.clone();
+    let writer = thread::spawn(move || {
+        let id = Notebook::open(&writer_dir)
+            .expect("open")
+            .append(&[(harness::day("2026-10-31"), harness::text("waited"))])
+            .expect("append");
+        done.send(id).expect("the test is listening");
+    });
+    assert!(
+        finished.recv_timeout(Duration::from_millis(500)).is_err(),
+        "append must wait while memo holds the lock"
+    );
+    assert_eq!(
+        fs::metadata(dir.join("LOG.txt")).expect("log").len(),
+        0,
+        "nothing was written meanwhile"
+    );
+
+    let mut stdin = holder.stdin.take().expect("piped stdin");
+    stdin.write_all(b"\n").expect("python is listening");
+    drop(stdin);
+    assert_eq!(
+        finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("append finishes once the lock is released"),
+        0,
+        "the first note"
+    );
+    writer.join().expect("writer thread finishes");
+    assert!(
+        holder.wait().expect("python exits").success(),
+        "memo releases cleanly"
+    );
 }
