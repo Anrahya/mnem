@@ -4,6 +4,7 @@
 //! that already fired. Entries older than [`KEEP_DAYS`] are pruned.
 
 use std::fs;
+use std::fs::File;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
@@ -18,39 +19,53 @@ use crate::tags;
 /// The ledger's file name in the notebook directory.
 pub const FILE: &str = "fired.log";
 
-/// Entries older than this many days are pruned. Anything due that long
-/// ago is stale (see `heartbeat::GRACE_DAYS`), so it cannot fire again.
+/// Entries older than this many days are pruned, unless the caller says
+/// the item they record could still fire.
 pub const KEEP_DAYS: i64 = 30;
 
 const LOCK: &str = ".fired.lock";
 
+/// The ledger's lock, held from reading what is due to recording what was
+/// handed over, so two briefs at once cannot both hand over one item.
+/// Dropping it releases the lock.
+#[derive(Debug)]
+pub struct Held {
+    _file: File,
+}
+
+/// Waits for the ledger's lock and takes it.
+pub fn hold(dir: &Path) -> Result<Held, NotebookError> {
+    let path = dir.join(LOCK);
+    let io_error = |source| NotebookError::Io {
+        path: path.clone(),
+        source,
+    };
+    let file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&path)
+        .map_err(io_error)?;
+    file.lock().map_err(io_error)?;
+    Ok(Held { _file: file })
+}
+
 /// Records that each of `handed` (an id, and the time it was due if it was
-/// timed) fired at `now`, and prunes old entries.
+/// timed) fired at `now`. Entries older than [`KEEP_DAYS`] are pruned unless
+/// `still_needed` says their item could fire again without them.
 pub fn record(
+    _held: &Held,
     dir: &Path,
     handed: &[(String, Option<DateTime>)],
     now: DateTime,
+    still_needed: impl Fn(&Fired) -> bool,
 ) -> Result<(), NotebookError> {
     if handed.is_empty() {
         return Ok(());
     }
-    let lock_path = dir.join(LOCK);
-    let lock = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&lock_path)
-        .map_err(|source| NotebookError::Io {
-            path: lock_path.clone(),
-            source,
-        })?;
-    lock.lock().map_err(|source| NotebookError::Io {
-        path: lock_path,
-        source,
-    })?;
     let since = now.checked_sub(Span::new().days(KEEP_DAYS)).unwrap_or(now);
     let mut text = String::new();
     for entry in read(dir)? {
-        if entry.at >= since {
+        if entry.at >= since || still_needed(&entry) {
             text.push_str(&line(&entry));
             text.push('\n');
         }
@@ -164,18 +179,22 @@ mod tests {
         fs::create_dir_all(&scratch.path).expect("dir");
         let old = tags::date_time("2026-09-01T08:00").expect("a time");
         let now = tags::date_time("2026-10-31T08:00").expect("a time");
-        fired::record(&scratch.path, &[("old".to_owned(), None)], old).expect("recorded");
+        let held = fired::hold(&scratch.path).expect("the lock");
+        let handed = [("old".to_owned(), None), ("kept".to_owned(), None)];
+        fired::record(&held, &scratch.path, &handed, old, |_| false).expect("recorded");
         let due = tags::date_time("2026-10-31T07:30").expect("a time");
         fired::record(
+            &held,
             &scratch.path,
             &[("a".to_owned(), None), ("r7".to_owned(), Some(due))],
             now,
+            |entry| entry.id == "kept",
         )
         .expect("recorded");
         assert_eq!(
             fs::read_to_string(scratch.path.join(fired::FILE)).expect("the ledger"),
-            "a 2026-10-31T08:00\nr7 2026-10-31T08:00 2026-10-31T07:30\n",
-            "entries past 30 days are pruned"
+            "kept 2026-09-01T08:00\na 2026-10-31T08:00\nr7 2026-10-31T08:00 2026-10-31T07:30\n",
+            "entries past 30 days are pruned, unless their item could still fire"
         );
         let ledger = fired::read(&scratch.path).expect("readable");
         assert!(

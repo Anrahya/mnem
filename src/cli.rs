@@ -38,6 +38,7 @@ use crate::heartbeat;
 use crate::heartbeat::Agenda;
 use crate::index::TagIndex;
 use crate::mind;
+use crate::mind::Nudge;
 use crate::model::CommandModel;
 use crate::model::Model;
 use crate::notebook::Notebook;
@@ -231,7 +232,8 @@ fn usage(context: &Context) -> String {
          \x20 brief session            MIND.md and what is due, for the start of a session\n\
          \x20 brief event <name>       what waits for an event the harness saw\n\
          \x20 fired <id> ...           record nudges the harness handed over itself\n\
-         Briefs record what they list as fired, so each nudge is handed over once.\n\n\
+         Briefs record what they list as fired before printing it, so each nudge is\n\
+         handed over at most once: a brief that is lost is not repeated.\n\n\
          Setup\n\
          \x20 init                     create the notebook, then print instructions for your agent\n\
          \x20 config [NAME=VALUE ...]  list the notebook's size settings, or set them\n\
@@ -1140,46 +1142,92 @@ fn fired_command(context: &Context, notebook: &Notebook, args: &[&str]) -> Outco
     if args.is_empty() {
         return Err(usage_error(context, "fired <id> ..."));
     }
+    let held = fired::hold(notebook.dir())?;
     let agenda = Agenda::read(notebook)?;
-    let mut ids = Vec::new();
+    let mut handed: Vec<(String, Option<DateTime>)> = Vec::new();
+    let mut unknown = Vec::new();
     for id in args {
         if id.is_empty() || id.chars().any(char::is_whitespace) {
             return Err(Failure::Said(format!("{id:?} is not a nudge id.")));
         }
+        if handed.iter().any(|(seen, _)| seen == id) {
+            continue;
+        }
         // Record the time it is due, so handing it over early counts.
         let mut due = None;
+        let mut known = false;
         for item in &agenda.items {
-            if item.id == *id
-                && let mind::When::At(at) = item.when
-            {
-                due = Some(at);
+            if item.id == *id {
+                known = true;
+                if let mind::When::At(at) = item.when {
+                    due = Some(at);
+                }
             }
         }
-        ids.push(((*id).to_owned(), due));
+        if !known {
+            unknown.push(*id);
+        }
+        handed.push(((*id).to_owned(), due));
     }
-    fired::record(notebook.dir(), &ids, context.now)?;
-    Ok(Reply::done(&[format!(
+    fired::record(&held, notebook.dir(), &handed, context.now, |entry| {
+        agenda.still_needed(entry, context.now)
+    })?;
+    let mut out = vec![format!(
         "Recorded {} as fired at {}.",
         count(
-            u64::try_from(ids.len()).unwrap_or(u64::MAX),
+            u64::try_from(handed.len()).unwrap_or(u64::MAX),
             "nudge",
             "nudges"
         ),
         fired::minutes(context.now)
-    )]))
+    )];
+    if !unknown.is_empty() {
+        out.push(format!(
+            "No current nudge or reminder has the id {}; check for a typo.",
+            unknown.join(", ")
+        ));
+    }
+    Ok(Reply::done(&out))
 }
 
 fn brief(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
     let form = "brief heartbeat | brief session | brief event <name>";
+    if !matches!(args, ["heartbeat"] | ["session"] | ["event", _]) {
+        return Err(usage_error(context, form));
+    }
+    // Held until what the brief lists is recorded, so two briefs at once
+    // cannot hand over the same item.
+    let held = fired::hold(notebook.dir())?;
     let agenda = Agenda::read(notebook)?;
     let now = context.now;
     let at = fired::minutes(now);
+    let me = &context.me;
     let mut out = Vec::new();
     let handed = match args {
-        ["heartbeat"] => {
-            let due = agenda.due(now);
+        ["session"] => session_brief(context, notebook, &agenda, &mut out)?,
+        ["event", name] => {
+            let (items, more) = heartbeat::capped(
+                agenda.for_event(name, now),
+                &format!("{me} brief event {name}"),
+            );
+            if items.is_empty() {
+                return Ok(Reply::done(&[format!(
+                    "Nothing waits for the event {name}."
+                )]));
+            }
+            out.push(format!("Event {name} at {at}."));
+            out.push(heartbeat::CAUTION.to_owned());
+            out.push(String::new());
+            out.extend(agenda.describe(notebook, &items)?);
+            out.extend(more);
+            items
+        }
+        _ => {
+            let (due, more) = heartbeat::capped(agenda.due(now), &format!("{me} brief heartbeat"));
             if due.is_empty() {
-                return Ok(Reply::done(&[format!("Nothing is due at {at}.")]));
+                let mut quiet = agenda.problems.clone();
+                quiet.push(format!("Nothing is due at {at}."));
+                return Ok(Reply::done(&quiet));
             }
             out.push(format!(
                 "Heartbeat at {at}: {} due. Handle {}, then end the session.",
@@ -1190,10 +1238,11 @@ fn brief(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
                 ),
                 if due.len() == 1 { "it" } else { "them" }
             ));
+            out.push(heartbeat::CAUTION.to_owned());
+            out.extend(agenda.problems.iter().cloned());
             out.push(String::new());
             out.extend(agenda.describe(notebook, &due)?);
-            out.push(String::new());
-            out.push(heartbeat::CAUTION.to_owned());
+            out.extend(more);
             if let Some(mind) = &agenda.mind {
                 let known = heartbeat::known(mind);
                 if !known.is_empty() {
@@ -1204,47 +1253,6 @@ fn brief(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
             }
             due
         }
-        ["session"] => {
-            out.push(format!("Session start, {at}."));
-            out.push(String::new());
-            match (&agenda.mind, &agenda.problem) {
-                (Some(mind), _) => {
-                    out.push("What you know (from MIND.md):".to_owned());
-                    let known = heartbeat::known(mind);
-                    if known.is_empty() {
-                        out.push("Nothing yet.".to_owned());
-                    }
-                    out.extend(known);
-                }
-                (None, Some(problem)) => out.push(problem.clone()),
-                (None, None) => out.push("No MIND.md yet: Dream has not run.".to_owned()),
-            }
-            let mut items = agenda.for_session(now);
-            items.extend(agenda.due(now));
-            if !items.is_empty() {
-                out.push(String::new());
-                out.push("For this session:".to_owned());
-                out.extend(agenda.describe(notebook, &items)?);
-                out.push(String::new());
-                out.push(heartbeat::CAUTION.to_owned());
-            }
-            items
-        }
-        ["event", name] => {
-            let items = agenda.for_event(name, now);
-            if items.is_empty() {
-                return Ok(Reply::done(&[format!(
-                    "Nothing waits for the event {name}."
-                )]));
-            }
-            out.push(format!("Event {name} at {at}:"));
-            out.push(String::new());
-            out.extend(agenda.describe(notebook, &items)?);
-            out.push(String::new());
-            out.push(heartbeat::CAUTION.to_owned());
-            items
-        }
-        _ => return Err(usage_error(context, form)),
     };
     let upcoming = agenda.upcoming(now);
     if !upcoming.is_empty() {
@@ -1255,8 +1263,54 @@ fn brief(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
         ));
         out.extend(heartbeat::upcoming_lines(&upcoming));
     }
-    fired::record(notebook.dir(), &heartbeat::handed(&handed), now)?;
+    fired::record(
+        &held,
+        notebook.dir(),
+        &heartbeat::handed(&handed),
+        now,
+        |entry| agenda.still_needed(entry, now),
+    )?;
     Ok(Reply::done(&out))
+}
+
+/// The session brief's lines, added to `out`; returns what it hands over.
+fn session_brief<'a>(
+    context: &Context,
+    notebook: &Notebook,
+    agenda: &'a Agenda,
+    out: &mut Vec<String>,
+) -> Result<Vec<&'a Nudge>, Failure> {
+    let now = context.now;
+    let at = fired::minutes(now);
+    let me = &context.me;
+    out.push(format!("Session start, {at}."));
+    out.push(String::new());
+    out.extend(agenda.problems.iter().cloned());
+    match &agenda.mind {
+        Some(mind) => {
+            out.push("What you know (from MIND.md):".to_owned());
+            let known = heartbeat::known(mind);
+            if known.is_empty() {
+                out.push("Nothing yet.".to_owned());
+            }
+            out.extend(known);
+        }
+        None if agenda.problems.is_empty() => {
+            out.push("No MIND.md yet: Dream has not run.".to_owned());
+        }
+        None => {}
+    }
+    let mut items = agenda.for_session(now);
+    items.extend(agenda.due(now));
+    let (items, more) = heartbeat::capped(items, &format!("{me} brief heartbeat"));
+    if !items.is_empty() {
+        out.push(String::new());
+        out.push("For this session:".to_owned());
+        out.push(heartbeat::CAUTION.to_owned());
+        out.extend(agenda.describe(notebook, &items)?);
+        out.extend(more);
+    }
+    Ok(items)
 }
 
 fn parse_block(raw: &str) -> Result<Span, Failure> {
@@ -2148,17 +2202,17 @@ mod tests {
         assert_eq!(
             ok(&context, &["due"]),
             "eggs | 2026-10-31T08:00 | 2026-10-31T10:00 | Suggest an omelette | Bought eggs (#0) | notify\n\
-             r1 | 2026-10-31T08:30 | - | Call mum [at 2026-10-31T08:30] | You set this reminder in #1. | notify\n",
+             r1 | 2026-10-31T08:30 | - | Reminder in your notes: #1 2026-10-31 Call mum [at 2026-10-31T08:30] | An [at] tag in that note asks for it now. | notify\n",
             "a nudge and a reminder are due; the month-old and the expired ones are stale"
         );
         let brief = ok(&context, &["brief", "heartbeat"]);
         for part in [
             "Heartbeat at 2026-10-31T09:00: 2 things are due. Handle them, then end the session.\n",
             "1. Suggest an omelette (tell the user)\n   Why: Bought eggs (#0)\n   Due: 2026-10-31T08:00, until 2026-10-31T10:00. Id: eggs.\n   #0 2026-10-31 Bought eggs and spinach\n",
-            "2. Call mum [at 2026-10-31T08:30] (tell the user)\n",
+            "2. Reminder in your notes: #1 2026-10-31 Call mum [at 2026-10-31T08:30] (tell the user)\n",
             heartbeat::CAUTION,
             "What you know (from MIND.md):\nDurable:\n- Likes omelettes (#0)\n",
-            "Coming up in the next 24 hours:\n- 2026-10-31T15:00 Dentist [at 2026-10-31T15:00] (r2)\n",
+            "Coming up in the next 24 hours:\n- 2026-10-31T15:00 Reminder in your notes: #2 2026-10-31 Dentist [at 2026-10-31T15:00] (r2)\n",
         ] {
             assert!(brief.contains(part), "the brief has {part:?}: {brief}");
         }
@@ -2174,7 +2228,10 @@ mod tests {
         );
         let session = ok(&context, &["brief", "session"]);
         assert!(
-            session.contains("For this session:\n1. Ask about the trip (prepare quietly; do not message the user)"),
+            session.contains(&format!(
+                "For this session:\n{}\n1. Ask about the trip (prepare quietly; do not message the user)",
+                heartbeat::CAUTION
+            )),
             "next-session nudges open the session: {session}"
         );
         assert!(
@@ -2210,6 +2267,82 @@ mod tests {
             "bad form"
         );
         assert!(fails(&context, &["fired"]).contains("usage"), "no ids");
+    }
+
+    #[test]
+    fn corrected_reminders_fire_once_and_only_when_replaced() {
+        let scratch = Scratch::new();
+        let context = notebook_with(&scratch, 0);
+        ok(&context, &["note", "Call mum [at 2026-10-31T08:30]"]);
+        assert!(
+            ok(&context, &["brief", "heartbeat"]).contains("Call mum"),
+            "the reminder fires"
+        );
+        ok(
+            &context,
+            &[
+                "note",
+                "[updates #0] Call mum and Sarah [at 2026-10-31T08:30]",
+            ],
+        );
+        assert_eq!(
+            ok(&context, &["brief", "heartbeat"]),
+            "Nothing is due at 2026-10-31T09:00.\n",
+            "a correction at the same time does not fire it again"
+        );
+        ok(&context, &["note", "Dentist [at 2026-10-31T08:45]"]);
+        ok(&context, &["note", "[updates #2] Bring the insurance card"]);
+        let brief = ok(&context, &["brief", "heartbeat"]);
+        assert!(
+            brief.contains("#2 2026-10-31 [superseded by #3] Dentist"),
+            "a correction without its own [at] leaves the reminder, marked: {brief}"
+        );
+        ok(
+            &context,
+            &[
+                "note",
+                "[updates #1] Call mum tonight [at 2026-10-31T08:50]",
+            ],
+        );
+        assert!(
+            ok(&context, &["brief", "heartbeat"]).contains("Call mum tonight"),
+            "a correction at a new time is a new reminder"
+        );
+    }
+
+    #[test]
+    fn briefs_are_capped_and_fired_checks_ids() {
+        let scratch = Scratch::new();
+        let context = notebook_with(&scratch, 0);
+        for minute in 10..22 {
+            ok(
+                &context,
+                &[
+                    "note",
+                    &format!("Task {minute} [at 2026-10-31T08:{minute}]"),
+                ],
+            );
+        }
+        let first = ok(&context, &["brief", "heartbeat"]);
+        assert!(
+            first.contains("10 things are due")
+                && first.contains("10. Reminder in your notes: #9 "),
+            "ten at a time, oldest first: {first}"
+        );
+        assert!(
+            first.contains("2 more wait; run mnem brief heartbeat again for them."),
+            "the rest are counted"
+        );
+        assert!(
+            ok(&context, &["brief", "heartbeat"]).contains("2 things are due"),
+            "the next brief has the rest"
+        );
+        assert_eq!(
+            ok(&context, &["fired", "nope", "nope"]),
+            "Recorded 1 nudge as fired at 2026-10-31T09:00.\n\
+             No current nudge or reminder has the id nope; check for a typo.\n",
+            "repeats are counted once, and unknown ids are pointed out"
+        );
     }
 
     #[test]

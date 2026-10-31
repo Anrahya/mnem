@@ -62,9 +62,6 @@ const REJECTED: &str = ".dream.rejected";
 /// notes stay in the notebook.
 pub const FAILURES_MAX: u32 = 3;
 
-/// Only fired nudges from this many days back are shown to the model.
-const FIRED_DAYS: i64 = 30;
-
 /// Nightly and idle dreams call the model only when at least this many
 /// notes are new.
 pub const MIN_NEW: u64 = 4;
@@ -512,7 +509,9 @@ fn prompt(
         new_notes.push(data(&index.shown(&note)));
     }
     let mut fired_lines = Vec::new();
-    let since = now.checked_sub(Span::new().days(FIRED_DAYS)).unwrap_or(now);
+    let since = now
+        .checked_sub(Span::new().days(fired::KEEP_DAYS))
+        .unwrap_or(now);
     for entry in ledger {
         if entry.at >= since {
             fired_lines.push(data(&fired::line(entry)));

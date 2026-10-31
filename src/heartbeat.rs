@@ -7,6 +7,8 @@
 //! notes (id `r<note id>`), which never wait for Dream. Everything handed to
 //! the agent is written to the fired ledger at once, so it fires once.
 
+use std::collections::HashMap;
+
 use jiff::Span;
 use jiff::civil::DateTime;
 
@@ -32,17 +34,25 @@ pub const AHEAD_HOURS: i64 = 24;
 /// The most cited notes shown under one item.
 const CITED_MAX: usize = 5;
 
+/// The most items one brief lists, and the most upcoming lines it shows.
+/// The rest wait for the next brief, so a flood of reminders cannot flood
+/// the agent's context.
+pub const BRIEF_MAX: usize = 10;
+
 /// What the heartbeat can hand the agent.
 #[derive(Clone, Debug, Default)]
 pub struct Agenda {
     /// MIND.md, if it could be read.
     pub mind: Option<Mind>,
-    /// Why MIND.md could not be read, if it exists and could not.
-    pub problem: Option<String>,
+    /// What could not be read: MIND.md, or a reminder's note.
+    pub problems: Vec<String>,
     /// MIND.md's nudges, then the notes' reminders.
     pub items: Vec<Nudge>,
     /// The fired ledger.
     pub ledger: Vec<Fired>,
+    /// For a reminder whose note corrects earlier ones, the ids of their
+    /// reminders: if one fired for the same time, this one has too.
+    aliases: HashMap<String, Vec<String>>,
     index: TagIndex,
 }
 
@@ -61,23 +71,52 @@ impl Agenda {
                     agenda.items.extend(mind.nudges.iter().cloned());
                     agenda.mind = Some(mind);
                 }
-                Err(missing) => agenda.problem = Some(format!("MIND.md cannot be read: {missing}")),
+                Err(missing) => agenda.problems.push(format!(
+                    "MIND.md cannot be read ({missing}), so its nudges are not listed."
+                )),
             }
         }
+        let mut reminders = Vec::new();
         for (id, reminder) in agenda.index.reminders() {
-            // A corrected note's reminder goes with it; the correction
-            // carries its own if it still applies.
-            if agenda.index.superseded_by(*id).is_some() {
+            // A correction that sets its own reminder replaces this one; a
+            // correction without one leaves it, marked superseded.
+            if agenda
+                .index
+                .superseded_by(*id)
+                .is_some_and(|newest| agenda.index.has_reminder(newest))
+            {
                 continue;
             }
-            agenda.items.push(Nudge {
-                id: format!("r{id}"),
-                when: When::At(reminder.at),
-                until: reminder.until,
-                action: notebook.note(*id)?.text,
-                why: format!("You set this reminder in #{id}."),
-                notify: true,
-            });
+            let note = match notebook.note(*id) {
+                Ok(note) => note,
+                Err(error) => {
+                    agenda
+                        .problems
+                        .push(format!("The reminder in #{id} cannot be read: {error}"));
+                    continue;
+                }
+            };
+            let mut older = Vec::new();
+            for old in agenda.index.corrects(*id) {
+                older.push(format!("r{old}"));
+            }
+            reminders.push((
+                Nudge {
+                    id: format!("r{id}"),
+                    when: When::At(reminder.at),
+                    until: reminder.until,
+                    action: format!("Reminder in your notes: {}", agenda.index.shown(&note)),
+                    why: "An [at] tag in that note asks for it now.".to_owned(),
+                    notify: true,
+                },
+                older,
+            ));
+        }
+        for (item, older) in reminders {
+            if !older.is_empty() {
+                agenda.aliases.insert(item.id.clone(), older);
+            }
+            agenda.items.push(item);
         }
         Ok(agenda)
     }
@@ -93,6 +132,7 @@ impl Agenda {
                 found.push(item);
             }
         }
+        found.sort_by_key(|item| when_key(item));
         found
     }
 
@@ -155,11 +195,32 @@ impl Agenda {
 
     /// Whether `item` has neither fired nor gone stale.
     fn live(&self, item: &Nudge, now: DateTime) -> bool {
-        let since = match item.when {
-            When::At(at) => Some(at),
-            When::NextSession | When::Event(_) => None,
-        };
-        !is_stale(item, now) && !fired::has_fired(&self.ledger, &item.id, since)
+        let due = when_key(item);
+        if is_stale(item, now) || fired::has_fired(&self.ledger, &item.id, due) {
+            return false;
+        }
+        for alias in self.aliases.get(&item.id).into_iter().flatten() {
+            if fired::has_fired(&self.ledger, alias, due) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether a ledger entry still stops an item from firing: some item
+    /// with its id, or one standing in for it, has not gone stale.
+    pub fn still_needed(&self, entry: &Fired, now: DateTime) -> bool {
+        for item in &self.items {
+            let named = item.id == entry.id
+                || self
+                    .aliases
+                    .get(&item.id)
+                    .is_some_and(|older| older.contains(&entry.id));
+            if named && !is_stale(item, now) {
+                return true;
+            }
+        }
+        false
     }
 
     /// The brief for `items`, numbered, with the notes each cites.
@@ -186,12 +247,12 @@ impl Agenda {
                 mind::when_text(&item.when),
                 item.id
             ));
-            let mut shown = 0;
+            let mut shown = Vec::new();
             for id in mind::cites(&item.why) {
-                if id >= len || shown >= CITED_MAX {
+                if id >= len || shown.len() >= CITED_MAX || shown.contains(&id) {
                     continue;
                 }
-                shown += 1;
+                shown.push(id);
                 out.push(format!("   {}", self.index.shown(&notebook.note(id)?)));
             }
         }
@@ -265,10 +326,11 @@ fn hunch_lines(mind: &Mind) -> Vec<String> {
     lines
 }
 
-/// One line per upcoming item: when, what, and its id.
+/// One line per upcoming item: when, what, and its id; at most
+/// [`BRIEF_MAX`], then a count of the rest.
 pub fn upcoming_lines(items: &[&Nudge]) -> Vec<String> {
     let mut out = Vec::new();
-    for item in items {
+    for item in items.iter().take(BRIEF_MAX) {
         out.push(format!(
             "- {} {} ({})",
             mind::when_text(&item.when),
@@ -276,5 +338,65 @@ pub fn upcoming_lines(items: &[&Nudge]) -> Vec<String> {
             item.id
         ));
     }
+    let rest = items.len().saturating_sub(BRIEF_MAX);
+    if rest > 0 {
+        out.push(format!("- and {rest} more."));
+    }
     out
+}
+
+/// The first [`BRIEF_MAX`] of `items`, and a line saying how many wait for
+/// the next brief, if any do.
+pub fn capped<'a>(items: Vec<&'a Nudge>, again: &str) -> (Vec<&'a Nudge>, Option<String>) {
+    let rest = items.len().saturating_sub(BRIEF_MAX);
+    let mut shown = items;
+    shown.truncate(BRIEF_MAX);
+    let note = (rest > 0).then(|| format!("{rest} more wait; run {again} again for them."));
+    (shown, note)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::heartbeat;
+    use crate::mind::Nudge;
+    use crate::mind::When;
+    use crate::tags;
+
+    fn item(when: When, until: Option<&str>) -> Nudge {
+        Nudge {
+            id: "x".to_owned(),
+            when,
+            until: until.map(|until| tags::date_time(until).expect("a valid time")),
+            action: "Do it".to_owned(),
+            why: "Because (#0)".to_owned(),
+            notify: true,
+        }
+    }
+
+    #[test]
+    fn items_go_stale_at_until_or_after_the_grace() {
+        let at = |value| tags::date_time(value).expect("a valid time");
+        let due = When::At(at("2026-10-01T08:00"));
+        let until = Some("2026-10-01T10:00");
+        assert!(
+            !heartbeat::is_stale(&item(due.clone(), until), at("2026-10-01T10:00")),
+            "live at its until"
+        );
+        assert!(
+            heartbeat::is_stale(&item(due.clone(), until), at("2026-10-01T10:01")),
+            "stale a minute after"
+        );
+        assert!(
+            !heartbeat::is_stale(&item(due.clone(), None), at("2026-10-08T08:00")),
+            "live for the whole grace"
+        );
+        assert!(
+            heartbeat::is_stale(&item(due, None), at("2026-10-08T08:01")),
+            "stale after it"
+        );
+        assert!(
+            !heartbeat::is_stale(&item(When::NextSession, None), at("2027-01-01T00:00")),
+            "untimed items wait"
+        );
+    }
 }

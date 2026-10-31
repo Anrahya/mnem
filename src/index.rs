@@ -72,6 +72,27 @@ impl TagIndex {
         Some(newest)
     }
 
+    /// Every earlier note that `id` corrects, directly or through notes it
+    /// corrects in turn.
+    pub fn corrects(&self, id: u64) -> Vec<u64> {
+        let mut found = Vec::new();
+        let mut frontier = vec![id];
+        while let Some(newer) = frontier.pop() {
+            for (&old, &by) in &self.corrected_by {
+                if by == newer && !found.contains(&old) {
+                    found.push(old);
+                    frontier.push(old);
+                }
+            }
+        }
+        found
+    }
+
+    /// Whether note `id` sets a reminder.
+    pub fn has_reminder(&self, id: u64) -> bool {
+        self.reminders.iter().any(|(note, _)| *note == id)
+    }
+
     /// The notes that say they happened on `day`, though written on another.
     pub fn happened_on(&self, day: &Day) -> Vec<u64> {
         let mut ids = Vec::new();
