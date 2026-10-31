@@ -37,6 +37,7 @@ use crate::fired;
 use crate::heartbeat;
 use crate::heartbeat::Agenda;
 use crate::index::TagIndex;
+use crate::memory;
 use crate::mind;
 use crate::mind::Nudge;
 use crate::model::CommandModel;
@@ -44,24 +45,13 @@ use crate::model::Model;
 use crate::notebook::Notebook;
 use crate::notebook::NotebookError;
 use crate::notebook::PutOutcome;
-use crate::record::Note;
 use crate::simhash;
 use crate::span::Span;
 use crate::span::SpanError;
 use crate::tags;
-use crate::tags::TagError;
 use crate::text;
 use crate::text::Text;
 use crate::text::TextError;
-
-/// How large a compiled `recall` pattern may grow. Patterns such as
-/// `\w{1000}` expand far past the regex crate's default limit, because `\w`
-/// covers all of Unicode.
-const RECALL_REGEX_BYTES: usize = 256 << 20;
-
-/// How many of the latest notes a new note is compared with to spot a
-/// repeat, so `note` stays fast however long the log grows.
-const REPEAT_WINDOW: u64 = 4096;
 
 /// What a command needs from outside the notebook.
 #[derive(Clone, Debug)]
@@ -558,13 +548,13 @@ fn note(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
     };
     let text =
         Text::try_new(raw, limit).map_err(|error| Failure::Said(text_problem(&error, "note")))?;
-    let found = checked_tags(text.as_str(), notebook.len()?).map_err(Failure::Said)?;
+    let found = memory::checked_tags(text.as_str(), notebook.len()?).map_err(Failure::Said)?;
     let print = simhash::fingerprint(text.as_str());
     let id = notebook.append(&[(context.today.clone(), text)])?;
     let notes = id.checked_add(1).ok_or(NotebookError::Overflow)?;
     let mut out = vec![format!("Noted as #{id}.")];
     if let Some(print) = print
-        && let Some(similar) = repeat_of(notebook, id, print, &found.updates)?
+        && let Some(similar) = memory::repeat_of(notebook, id, print, &found.updates)?
     {
         out.push(format!(
             "It nearly repeats #{}: {}\nNothing more to do now. Before noting, {} recall shows what is already there.",
@@ -572,54 +562,6 @@ fn note(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
         ));
     }
     with_next_summary(context, notebook, out, notes)
-}
-
-/// The tags of a note about to be written when `before` notes exist, or why
-/// they are wrong.
-fn checked_tags(text: &str, before: u64) -> Result<tags::Tags, String> {
-    let found = tags::parse(text).map_err(|error: TagError| error.to_string())?;
-    for target in &found.updates {
-        if *target >= before {
-            return Err(format!(
-                "[updates #{target}] names a note that is not written yet; the notebook holds {} before this one.",
-                count(before, "note", "notes")
-            ));
-        }
-    }
-    Ok(found)
-}
-
-/// The newest of the [`REPEAT_WINDOW`] notes before `id` that note `id`,
-/// whose fingerprint is `print`, nearly repeats. Notes it corrects, and
-/// notes already superseded, do not count: saying again what was
-/// corrected away is news.
-fn repeat_of(
-    notebook: &Notebook,
-    id: u64,
-    print: u64,
-    corrects: &[u64],
-) -> Result<Option<Note>, Failure> {
-    let mut index = TagIndex::default();
-    let mut near = Vec::new();
-    for note in notebook.scan_from(id.saturating_sub(REPEAT_WINDOW))? {
-        let note = note?;
-        if note.id >= id {
-            break;
-        }
-        index.add(&note);
-        if corrects.contains(&note.id) {
-            continue;
-        }
-        if let Some(other) = simhash::fingerprint(&note.text)
-            && simhash::distance(print, other) <= simhash::NEAR
-        {
-            near.push(note);
-        }
-    }
-    Ok(near
-        .into_iter()
-        .rev()
-        .find(|note| index.superseded_by(note.id).is_none()))
 }
 
 fn nap(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
@@ -711,7 +653,7 @@ fn recall(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
     };
     let regex = RegexBuilder::new(pattern)
         .case_insensitive(true)
-        .size_limit(RECALL_REGEX_BYTES)
+        .size_limit(memory::RECALL_REGEX_BYTES)
         .build()
         .map_err(|error| {
             Failure::Said(format!(
@@ -974,7 +916,7 @@ fn import(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
             Failure::Said(format!("line {number}: {}", text_problem(&error, "note")))
         })?;
         let before = notes.saturating_add(u64::try_from(batch.len()).unwrap_or(u64::MAX));
-        checked_tags(text.as_str(), before)
+        memory::checked_tags(text.as_str(), before)
             .map_err(|problem| Failure::Said(format!("line {number}: {problem}")))?;
         last = Some(day.as_str().to_owned());
         batch.push((day, text));
@@ -1083,6 +1025,9 @@ fn dream(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
         dream::Outcome::Busy => {
             Reply::done(&["A dream is already running on this notebook.".to_owned()])
         }
+        dream::Outcome::Settled => Reply::done(&[
+            "Another dream already read these notes; MIND.md is up to date.".to_owned(),
+        ]),
         dream::Outcome::Dreamed {
             first,
             end,

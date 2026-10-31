@@ -14,6 +14,7 @@ mod files;
 pub mod fired;
 pub mod heartbeat;
 pub mod index;
+pub mod memory;
 pub mod mind;
 pub mod model;
 pub mod notebook;

@@ -48,7 +48,9 @@ pub fn distance(a: u64, b: u64) -> u32 {
     (a ^ b).count_ones()
 }
 
-fn fnv1a(word: &str) -> u64 {
+/// 64-bit FNV-1a of `text`'s bytes: a hash that is stable across runs and
+/// builds.
+pub(crate) fn fnv1a(word: &str) -> u64 {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in word.bytes() {
         hash ^= u64::from(byte);

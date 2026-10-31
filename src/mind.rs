@@ -361,6 +361,43 @@ pub fn cites(text: &str) -> Vec<u64> {
     ids
 }
 
+/// Gives each nudge of `draft` that Dream renamed the id it had in `old`,
+/// so the fired ledger and the harness's schedule still recognize it. A
+/// nudge with a new id takes the id of an old nudge not carried over that is
+/// due at the same time and cites a note in common with it, or that asks
+/// for the same thing in the same words.
+pub fn keep_ids(draft: &mut Mind, old: &Mind) {
+    let mut taken: HashSet<String> = HashSet::new();
+    for nudge in &draft.nudges {
+        taken.insert(nudge.id.clone());
+    }
+    for nudge in &mut draft.nudges {
+        if old.nudges.iter().any(|previous| previous.id == nudge.id) {
+            continue;
+        }
+        let cited: HashSet<u64> = cites(&nudge.why).into_iter().collect();
+        let action = plain(&nudge.action);
+        for previous in &old.nudges {
+            if taken.contains(&previous.id) {
+                continue;
+            }
+            let same_time = previous.when == nudge.when
+                && cites(&previous.why).iter().any(|id| cited.contains(id));
+            if same_time || plain(&previous.action) == action {
+                taken.insert(previous.id.clone());
+                nudge.id.clone_from(&previous.id);
+                break;
+            }
+        }
+    }
+}
+
+/// `text` in lowercase with its words separated by single spaces.
+fn plain(text: &str) -> String {
+    let words: Vec<String> = text.split_whitespace().map(str::to_lowercase).collect();
+    words.join(" ")
+}
+
 /// What [`check`] needs to know about the notebook.
 #[derive(Clone, Debug, Default)]
 pub struct Facts {
@@ -858,6 +895,78 @@ mod tests {
             dropped.first().map(|item| item.line.as_str()),
             Some(format!("Item {} (#0)", mind::ACTIVE_MAX).as_str()),
             "the last lines go"
+        );
+    }
+
+    #[test]
+    fn renamed_nudges_keep_their_ids() {
+        let nudge = |id: &str, when: When, action: &str, why: &str| Nudge {
+            id: id.to_owned(),
+            when,
+            until: None,
+            action: action.to_owned(),
+            why: why.to_owned(),
+            notify: true,
+        };
+        let morning = When::At(at("2026-11-01T08:00"));
+        let old = Mind {
+            nudges: vec![
+                nudge(
+                    "eggs",
+                    morning.clone(),
+                    "Suggest an omelette",
+                    "Bought eggs (#4)",
+                ),
+                nudge(
+                    "call",
+                    When::NextSession,
+                    "Call the bank",
+                    "Card blocked (#7)",
+                ),
+                nudge(
+                    "kept",
+                    When::NextSession,
+                    "Water the plants",
+                    "Dry soil (#9)",
+                ),
+            ],
+            ..Mind::default()
+        };
+        let mut draft = Mind {
+            nudges: vec![
+                nudge(
+                    "omelette",
+                    morning,
+                    "Offer to cook eggs",
+                    "Eggs in the fridge (#4, #5)",
+                ),
+                nudge(
+                    "bank",
+                    When::Event("home".to_owned()),
+                    "call  the BANK",
+                    "Still blocked (#8)",
+                ),
+                nudge(
+                    "kept",
+                    When::NextSession,
+                    "Water the plants",
+                    "Dry soil (#9)",
+                ),
+                nudge(
+                    "new",
+                    When::NextSession,
+                    "Water the plants",
+                    "Dry again (#10)",
+                ),
+            ],
+            ..Mind::default()
+        };
+        mind::keep_ids(&mut draft, &old);
+        let ids: Vec<&str> = draft.nudges.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["eggs", "call", "kept", "new"],
+            "same time and a shared cite, or the same words, keep the old id; an id carried over is not taken twice"
         );
     }
 }

@@ -31,6 +31,17 @@ standard input, `MNEM_JOB` is `summary` or `dream`, the reply goes to standard
 output, and exit status 3 means the model declined. `mnem init` prints the
 instructions to add to the agent's system prompt.
 
+### As a library
+
+A harness written in Rust can embed Mnem instead of running it:
+`mnem::memory::Memory` opens a notebook and offers notes, recall, zoom,
+wake, MIND.md and the agenda as plain calls. The summarizer and Dream
+come as job/apply pairs: the library hands over a prompt, the harness asks
+its own model, and the library checks the answer before anything is
+written. Calls take the current time as an argument and never call a
+model. Notes start with `[by <agent>]`, so several agents can share one
+notebook.
+
 ## Build
 
 Requires Rust 1.98 or newer.
