@@ -25,8 +25,12 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
 use std::io::Read;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -133,8 +137,8 @@ impl CommandModel {
                 .env_remove("MEMORY_DIR")
                 .env_remove("MNEM_MODEL")
                 .stdin(Stdio::from(File::open(&exchange.input)?))
-                .stdout(Stdio::from(File::create(&exchange.output)?))
-                .stderr(Stdio::from(File::create(&exchange.errors)?));
+                .stdout(Stdio::from(rewrite(&exchange.output)?))
+                .stderr(Stdio::from(rewrite(&exchange.errors)?));
             #[cfg(unix)]
             command.process_group(0);
             match command.spawn() {
@@ -208,9 +212,27 @@ impl Exchange {
             output: dir.join(format!("{stem}.reply")),
             errors: dir.join(format!("{stem}.errors")),
         };
-        fs::write(&exchange.input, prompt)?;
+        // Each file is new, so a link planted at its name is refused, and
+        // only this user can read the notebook material in it.
+        private(&exchange.input)?.write_all(prompt.as_bytes())?;
+        private(&exchange.output)?;
+        private(&exchange.errors)?;
         Ok(exchange)
     }
+}
+
+/// Creates `path`, which must not exist, readable only by this user.
+fn private(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
+/// Opens a file [`private`] made, emptied for another try.
+fn rewrite(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).truncate(true).open(path)
 }
 
 impl Drop for Exchange {

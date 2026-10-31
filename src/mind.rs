@@ -56,6 +56,10 @@ pub const FADE_AFTER: usize = 2;
 
 const ID_MAX: usize = 32;
 
+/// The longest line, in bytes, any section keeps: MIND.md is read at every
+/// session start and fed back into every dream.
+pub const LINE_MAX: usize = 400;
+
 /// The contents of MIND.md.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Mind {
@@ -344,7 +348,10 @@ pub fn cites(text: &str) -> Vec<u64> {
             break;
         };
         rest = tail;
-        if digits.is_empty() || tail.starts_with('-') {
+        let range = tail
+            .strip_prefix('-')
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+        if digits.is_empty() || range {
             continue;
         }
         if let Ok(id) = digits.parse::<u64>() {
@@ -476,8 +483,11 @@ fn cap<T>(items: &mut Vec<T>, max: usize, dropped: &mut Vec<Dropped>, line: fn(&
 }
 
 /// The ids `text` cites, if they are valid: at least one, all of them real
-/// notes, and not all superseded.
+/// notes, and not all superseded. Also checks the line's length.
 fn cited(text: &str, facts: &Facts) -> Result<Vec<u64>, String> {
+    if text.len() > LINE_MAX {
+        return Err(format!("it is longer than {LINE_MAX} bytes"));
+    }
     let ids = cites(text);
     if ids.is_empty() {
         return Err("it cites no note".to_owned());
@@ -500,7 +510,9 @@ fn check_hunch(hunch: &Hunch, facts: &Facts) -> Result<(), String> {
     let ids = cited(&hunch.text, facts)?;
     let mut days = HashSet::new();
     for id in &ids {
-        days.insert(facts.day(*id));
+        if let Some(day) = facts.day(*id) {
+            days.insert(day);
+        }
     }
     if days.len() < 2 {
         return Err("a hunch needs notes from two different days".to_owned());
@@ -518,6 +530,9 @@ fn check_nudge(
     ledger: &[Fired],
     now: DateTime,
 ) -> Result<(), String> {
+    if nudge_line(nudge).len() > LINE_MAX {
+        return Err(format!("it is longer than {LINE_MAX} bytes"));
+    }
     cited(&nudge.why, facts)?;
     if nudge.until.is_some_and(|until| until < now) {
         return Err("it is stale: its until time has passed".to_owned());
@@ -659,8 +674,8 @@ mod tests {
     #[test]
     fn citations_name_notes_not_summaries() {
         assert_eq!(
-            mind::cites("Moved (#902, replaces #455), see #0-15 and #7."),
-            [902, 455, 7],
+            mind::cites("Moved (#902, replaces #455), see #0-15, #7, #5-#6 and #12-ish."),
+            [902, 455, 7, 5, 6, 12],
             "summary ranges are not citations"
         );
         assert!(mind::cites("C# and # alone").is_empty(), "no digits, no id");
@@ -800,6 +815,23 @@ mod tests {
             "x 2026-10-31T09:00",
             "the ledger uses the same minutes"
         );
+    }
+
+    #[test]
+    fn long_lines_are_dropped() {
+        let facts = facts(&[("2026-10-30", "A note")]);
+        let long = format!("{} (#0)", "word ".repeat(mind::LINE_MAX / 5));
+        let mind = Mind {
+            durable: vec![long],
+            nudges: vec![Nudge {
+                action: "x".repeat(mind::LINE_MAX),
+                ..nudge("long", When::NextSession, None)
+            }],
+            ..Mind::default()
+        };
+        let (kept, dropped) = mind::check(mind, &facts, &[], at("2026-10-31T09:00"));
+        assert_eq!(kept, Mind::default(), "neither line fits");
+        assert_eq!(dropped.len(), 2, "both are reported");
     }
 
     #[test]

@@ -1085,7 +1085,8 @@ fn dream(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
             dream::LOG
         )),
         dream::Outcome::Unavailable(why) => failed(format!(
-            "The model could not be reached ({why}); MIND.md is unchanged."
+            "The model could not be reached ({why}); MIND.md is unchanged. See {}.",
+            dream::LOG
         )),
     })
 }
