@@ -1,19 +1,72 @@
-//! The fired-nudge ledger, `fired.log`: one `<id> <YYYY-MM-DDTHH:MM>` line
-//! for each nudge or reminder handed to the agent, so each fires once
-//! across sessions and dreams. Dream reads it to drop or re-time nudges
-//! that already fired.
+//! The fired-nudge ledger, `fired.log`: one `<id> <fired at>` line, with
+//! the time it was due after it when it had one, for each nudge or reminder
+//! handed to the agent, so each fires once across sessions and dreams. Dream reads it to drop or re-time nudges
+//! that already fired. Entries older than [`KEEP_DAYS`] are pruned.
 
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 
+use jiff::Span;
 use jiff::civil::DateTime;
 
+use crate::files;
 use crate::notebook::NotebookError;
 use crate::tags;
 
 /// The ledger's file name in the notebook directory.
 pub const FILE: &str = "fired.log";
+
+/// Entries older than this many days are pruned. Anything due that long
+/// ago is stale (see `heartbeat::GRACE_DAYS`), so it cannot fire again.
+pub const KEEP_DAYS: i64 = 30;
+
+const LOCK: &str = ".fired.lock";
+
+/// Records that each of `handed` (an id, and the time it was due if it was
+/// timed) fired at `now`, and prunes old entries.
+pub fn record(
+    dir: &Path,
+    handed: &[(String, Option<DateTime>)],
+    now: DateTime,
+) -> Result<(), NotebookError> {
+    if handed.is_empty() {
+        return Ok(());
+    }
+    let lock_path = dir.join(LOCK);
+    let lock = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(|source| NotebookError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+    lock.lock().map_err(|source| NotebookError::Io {
+        path: lock_path,
+        source,
+    })?;
+    let since = now.checked_sub(Span::new().days(KEEP_DAYS)).unwrap_or(now);
+    let mut text = String::new();
+    for entry in read(dir)? {
+        if entry.at >= since {
+            text.push_str(&line(&entry));
+            text.push('\n');
+        }
+    }
+    for (id, due) in handed {
+        text.push_str(&line(&Fired {
+            id: id.clone(),
+            at: now,
+            due: *due,
+        }));
+        text.push('\n');
+    }
+    // The ledger is small, so it is rewritten whole: a crash leaves the old
+    // ledger or the new one, never a torn line.
+    files::replace(&dir.join(FILE), &text)
+}
 
 /// One fired nudge.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +75,8 @@ pub struct Fired {
     pub id: String,
     /// When it fired.
     pub at: DateTime,
+    /// When it was due, for a timed nudge.
+    pub due: Option<DateTime>,
 }
 
 /// Every entry of the ledger in `dir`, oldest first. A missing ledger is
@@ -43,20 +98,33 @@ pub fn read(dir: &Path) -> Result<Vec<Fired>, NotebookError> {
     Ok(entries)
 }
 
-/// Whether `id` fired at or after `since` (at any time when `since` is
-/// `None`).
-pub fn has_fired(ledger: &[Fired], id: &str, since: Option<DateTime>) -> bool {
+/// Whether `id`, due at `due` if it is timed, has fired. A timed nudge
+/// that Dream moved to a new time is new again: an entry counts only for
+/// the time it was due.
+pub fn has_fired(ledger: &[Fired], id: &str, due: Option<DateTime>) -> bool {
     for entry in ledger {
-        if entry.id == id && since.is_none_or(|since| entry.at >= since) {
+        if entry.id != id {
+            continue;
+        }
+        let same_time = match (due, entry.due) {
+            (None, _) => true,
+            (Some(due), Some(fired_for)) => due == fired_for,
+            // Fired without a due time: it covers what was due by then.
+            (Some(due), None) => entry.at >= due,
+        };
+        if same_time {
             return true;
         }
     }
     false
 }
 
-/// The ledger line for `id` firing at `at`.
-pub fn line(id: &str, at: DateTime) -> String {
-    format!("{id} {}", minutes(at))
+/// The ledger line for `entry`.
+pub fn line(entry: &Fired) -> String {
+    match entry.due {
+        Some(due) => format!("{} {} {}", entry.id, minutes(entry.at), minutes(due)),
+        None => format!("{} {}", entry.id, minutes(entry.at)),
+    }
 }
 
 /// `at` written `YYYY-MM-DDTHH:MM`, the form tags and MIND.md use.
@@ -65,13 +133,20 @@ pub fn minutes(at: DateTime) -> String {
 }
 
 fn parse_line(line: &str) -> Option<Fired> {
-    let (id, at) = line.split_once(' ')?;
-    if id.is_empty() {
+    let mut fields = line.split(' ');
+    let id = fields.next().filter(|id| !id.is_empty())?;
+    let at = tags::date_time(fields.next()?)?;
+    let due = match fields.next() {
+        Some(due) => Some(tags::date_time(due)?),
+        None => None,
+    };
+    if fields.next().is_some() {
         return None;
     }
     Some(Fired {
         id: id.to_owned(),
-        at: tags::date_time(at.trim())?,
+        at,
+        due,
     })
 }
 
@@ -84,6 +159,36 @@ mod tests {
     use crate::testing::Scratch;
 
     #[test]
+    fn recording_appends_and_prunes() {
+        let scratch = Scratch::new();
+        fs::create_dir_all(&scratch.path).expect("dir");
+        let old = tags::date_time("2026-09-01T08:00").expect("a time");
+        let now = tags::date_time("2026-10-31T08:00").expect("a time");
+        fired::record(&scratch.path, &[("old".to_owned(), None)], old).expect("recorded");
+        let due = tags::date_time("2026-10-31T07:30").expect("a time");
+        fired::record(
+            &scratch.path,
+            &[("a".to_owned(), None), ("r7".to_owned(), Some(due))],
+            now,
+        )
+        .expect("recorded");
+        assert_eq!(
+            fs::read_to_string(scratch.path.join(fired::FILE)).expect("the ledger"),
+            "a 2026-10-31T08:00\nr7 2026-10-31T08:00 2026-10-31T07:30\n",
+            "entries past 30 days are pruned"
+        );
+        let ledger = fired::read(&scratch.path).expect("readable");
+        assert!(
+            fired::has_fired(&ledger, "r7", Some(due)),
+            "fired for its time"
+        );
+        assert!(
+            !fired::has_fired(&ledger, "r7", Some(now)),
+            "moved to another time, it is new again"
+        );
+    }
+
+    #[test]
     fn reads_the_ledger_and_skips_torn_lines() {
         let scratch = Scratch::new();
         fs::create_dir_all(&scratch.path).expect("dir");
@@ -94,7 +199,14 @@ mod tests {
         let at = tags::date_time("2026-10-30T08:00").expect("a time");
         fs::write(
             scratch.path.join(fired::FILE),
-            format!("{}\nr12 2026-10-30T09:\n", fired::line("tea", at)),
+            format!(
+                "{}\nr12 2026-10-30T09:\n",
+                fired::line(&fired::Fired {
+                    id: "tea".to_owned(),
+                    at,
+                    due: None
+                })
+            ),
         )
         .expect("write");
         let ledger = fired::read(&scratch.path).expect("readable");

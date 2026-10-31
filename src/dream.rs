@@ -30,6 +30,7 @@ use jiff::Span;
 use jiff::civil::DateTime;
 
 use crate::cover;
+use crate::files;
 use crate::fired;
 use crate::fired::Fired;
 use crate::mind;
@@ -264,9 +265,9 @@ fn locked(
             "flagged: {line} (few words in common with the notes it cites)"
         ));
     }
-    replace(&dir.join(mind::FILE), &mind::render(&kept))?;
-    replace(&dir.join(WATERMARK), &format!("{end}\n"))?;
-    remove(&dir.join(REJECTED))?;
+    files::replace(&dir.join(mind::FILE), &mind::render(&kept))?;
+    files::replace(&dir.join(WATERMARK), &format!("{end}\n"))?;
+    files::remove(&dir.join(REJECTED))?;
     // The dream is committed; failing now over the advisory log would
     // report a failure that did not happen.
     drop(append_log(dir, &entry));
@@ -304,7 +305,7 @@ fn tidy(
     }
     entry.push("expired lines without a model call".to_owned());
     log_dropped(entry, &dropped);
-    replace(&dir.join(mind::FILE), &mind::render(&kept))?;
+    files::replace(&dir.join(mind::FILE), &mind::render(&kept))?;
     Ok(dropped.len())
 }
 
@@ -396,11 +397,11 @@ fn failed(
         _ => 1,
     };
     if count < FAILURES_MAX {
-        replace(&path, &format!("{first} {count}\n"))?;
+        files::replace(&path, &format!("{first} {count}\n"))?;
         return Ok(false);
     }
-    replace(&dir.join(WATERMARK), &format!("{end}\n"))?;
-    remove(&path)?;
+    files::replace(&dir.join(WATERMARK), &format!("{end}\n"))?;
+    files::remove(&path)?;
     entry.push(format!(
         "gave up on notes #{first} to #{} after {count} failed dreams; the next dream starts after them",
         end.saturating_sub(1)
@@ -419,14 +420,6 @@ fn facts(notebook: &Notebook, end: u64) -> Result<Facts, NotebookError> {
         facts.add(&note);
     }
     Ok(facts)
-}
-
-fn remove(path: &Path) -> Result<(), NotebookError> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(io_error(path, source)),
-    }
 }
 
 /// Notebook material as it goes into the prompt, with angle brackets
@@ -522,7 +515,7 @@ fn prompt(
     let since = now.checked_sub(Span::new().days(FIRED_DAYS)).unwrap_or(now);
     for entry in ledger {
         if entry.at >= since {
-            fired_lines.push(data(&fired::line(&entry.id, entry.at)));
+            fired_lines.push(data(&fired::line(entry)));
         }
     }
     let none = "(none)".to_owned();
@@ -614,30 +607,6 @@ pub fn read_mind(dir: &Path) -> Result<Option<String>, NotebookError> {
     }
 }
 
-/// Replaces `path` with `contents` all at once: readers see the old file
-/// or the new one, never part of either.
-pub(crate) fn replace(path: &Path, contents: &str) -> Result<(), NotebookError> {
-    let mut name = path.file_name().unwrap_or_default().to_owned();
-    name.push(".tmp");
-    let temp = path.with_file_name(name);
-    let written = File::create(&temp)
-        .and_then(|mut file| {
-            file.write_all(contents.as_bytes())?;
-            file.sync_all()
-        })
-        .and_then(|()| fs::rename(&temp, path));
-    written.map_err(|source| {
-        drop(fs::remove_file(&temp));
-        io_error(path, source)
-    })?;
-    // Make the rename itself durable, so after a power cut MIND.md is never
-    // older than the watermark written after it.
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| io_error(parent, source))
-}
-
 /// Appends `entry` to the log, dropping its oldest entries when it is
 /// too large.
 fn append_log(dir: &Path, entry: &[String]) -> Result<(), NotebookError> {
@@ -667,7 +636,7 @@ fn append_log(dir: &Path, entry: &[String]) -> Result<(), NotebookError> {
     let tail = String::from_utf8_lossy(&tail);
     // Start at a whole entry.
     let kept = tail.split_once("\n\n").map_or(&*tail, |(_, rest)| rest);
-    replace(&path, kept)
+    files::replace(&path, kept)
 }
 
 fn io_error(path: &Path, source: io::Error) -> NotebookError {

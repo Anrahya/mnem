@@ -767,14 +767,17 @@ mod tests {
             Fired {
                 id: "fired".to_owned(),
                 at: at("2026-10-31T08:00"),
+                due: None,
             },
             Fired {
                 id: "moved".to_owned(),
                 at: at("2026-10-30T08:00"),
+                due: None,
             },
             Fired {
                 id: "asked".to_owned(),
                 at: at("2026-10-30T08:00"),
+                due: None,
             },
         ];
         let mind = Mind {
@@ -811,7 +814,11 @@ mod tests {
             "each dropped nudge says why"
         );
         assert_eq!(
-            fired::line("x", now),
+            fired::line(&Fired {
+                id: "x".to_owned(),
+                at: now,
+                due: None
+            }),
             "x 2026-10-31T09:00",
             "the ledger uses the same minutes"
         );
