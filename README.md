@@ -39,3 +39,9 @@ Requires Rust 1.98 or newer.
 cargo build
 cargo test
 ```
+
+## Licence
+
+MIT; see `LICENSE`. The compactor's summary prompt is adapted from
+UniiChat and stays under Apache-2.0 (`LICENSE-APACHE`); `NOTICE` has the
+details.

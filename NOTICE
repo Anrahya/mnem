@@ -1,5 +1,7 @@
 Mnem
 
+Mnem is licensed under the MIT License (LICENSE).
+
 This project includes material adapted, with changes, from UniiChat
 (https://github.com/VictorTaelin/uniichat) by Victor Taelin, licensed under
 the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0):
@@ -7,6 +9,9 @@ the Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0):
 - src/compactor.rs: the summary prompt, adapted from UniiChat's compaction
   prompt (prompt.txt and Memory.ts), and the rule of keeping the shortest try
   and cutting the input when the model declines (Memory.build).
+
+That adapted material remains under the Apache License, Version 2.0; a copy
+is in LICENSE-APACHE.
 
 Mnem reads and writes the notebook format of OptMem
 (https://github.com/VictorTaelin/OptMem). It re-implements that format from

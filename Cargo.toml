@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.98"
 description = "Memory for proactive agents: an OptMem-compatible notebook, a nightly Dream pass, and a nudge heartbeat."
+license = "MIT AND Apache-2.0"
 publish = false
 
 [dependencies]
