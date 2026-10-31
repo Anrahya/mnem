@@ -3,8 +3,8 @@
 //! Mnem has no model of its own: the agent's harness answers. The harness
 //! names a program; Mnem runs it with the prompt on standard input and reads
 //! the reply from standard output. The program learns what the call is for
-//! from `MNEM_JOB` and `MNEM_EFFORT`, so it can pick a cheap, fast setting
-//! for summaries. It does not get `MEMORY_DIR` or `MNEM_SUMMARIZER`, so a
+//! from `MNEM_JOB` (`summary` or `dream`) and `MNEM_EFFORT`, so it can pick
+//! a cheap, fast setting for summaries and a stronger one for Dream. It does not get `MEMORY_DIR` or `MNEM_MODEL`, so a
 //! program that is itself an agent cannot write to the notebook.
 //!
 //! The program's exit tells Mnem how the call went:
@@ -63,6 +63,8 @@ const BUSY_TRIES: u32 = 5;
 pub enum Job {
     /// One summary line for a block of the notebook: small and mechanical.
     Summary,
+    /// A new MIND.md from what the notebook learned: the hard one.
+    Dream,
 }
 
 impl Job {
@@ -70,6 +72,7 @@ impl Job {
     pub fn name(self) -> &'static str {
         match self {
             Self::Summary => "summary",
+            Self::Dream => "dream",
         }
     }
 
@@ -77,6 +80,7 @@ impl Job {
     pub fn effort(self) -> &'static str {
         match self {
             Self::Summary => "low",
+            Self::Dream => "high",
         }
     }
 }
@@ -127,7 +131,7 @@ impl CommandModel {
                 .env("MNEM_JOB", job.name())
                 .env("MNEM_EFFORT", job.effort())
                 .env_remove("MEMORY_DIR")
-                .env_remove("MNEM_SUMMARIZER")
+                .env_remove("MNEM_MODEL")
                 .stdin(Stdio::from(File::open(&exchange.input)?))
                 .stdout(Stdio::from(File::create(&exchange.output)?))
                 .stderr(Stdio::from(File::create(&exchange.errors)?));
@@ -305,7 +309,7 @@ mod tests {
         let scratch = Scratch::new();
         let program = script(
             &scratch,
-            r#"read -r first; echo "$MNEM_JOB $MNEM_EFFORT ${MEMORY_DIR:-no-dir} ${MNEM_SUMMARIZER:-none}: $first""#,
+            r#"read -r first; echo "$MNEM_JOB $MNEM_EFFORT ${MEMORY_DIR:-no-dir} ${MNEM_MODEL:-none}: $first""#,
         );
         assert_eq!(
             ask(program, PATIENT, "hello\nmore"),

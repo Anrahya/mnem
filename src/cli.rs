@@ -18,6 +18,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
+use jiff::civil::DateTime;
 use regex::RegexBuilder;
 
 use crate::compactor;
@@ -30,8 +31,11 @@ use crate::config::Knob;
 use crate::cover;
 use crate::day::Day;
 use crate::day::DayError;
+use crate::dream;
+use crate::dream::Trigger;
 use crate::index::TagIndex;
 use crate::model::CommandModel;
+use crate::model::Model;
 use crate::notebook::Notebook;
 use crate::notebook::NotebookError;
 use crate::notebook::PutOutcome;
@@ -65,9 +69,12 @@ pub struct Context {
     pub home: Option<PathBuf>,
     /// The day new notes are dated with.
     pub today: Day,
-    /// The program that writes summaries, if the harness provides one.
-    /// Without it the agent is asked to write them, as in stock OptMem.
-    pub summarizer: Option<CommandModel>,
+    /// The local time now, for Dream's expiry and the heartbeat.
+    pub now: DateTime,
+    /// The program that answers model calls (summaries and Dream), if the
+    /// harness provides one. Without it the agent is asked to write
+    /// summaries, as in stock OptMem, and Dream only expires old lines.
+    pub model: Option<CommandModel>,
 }
 
 /// A command's output and exit status.
@@ -186,6 +193,7 @@ fn command_named(name: &str) -> Option<Command> {
         "config" => config,
         "import" => import,
         "compact" => compact,
+        "dream" => dream,
         _ => return None,
     };
     Some(command)
@@ -205,7 +213,9 @@ fn usage(context: &Context) -> String {
          \x20 note \"<line>\"            add a note of one line\n\
          \x20 nap [<lo>-<hi> \"<line>\"] show or write the next summary that is due\n\
          \x20 forget <lo>-<hi>         discard a summary and every summary built on it\n\
-         \x20 compact                  write every due summary with the summarizer\n\n\
+         \x20 compact                  write every due summary with the summarizer\n\
+         \x20 dream <when>             rewrite MIND.md from new notes; <when> is nightly,\n\
+         \x20                          idle or compact (for schedulers and hooks)\n\n\
          Setup\n\
          \x20 init                     create the notebook, then print instructions for your agent\n\
          \x20 config [NAME=VALUE ...]  list the notebook's size settings, or set them\n\
@@ -214,8 +224,8 @@ fn usage(context: &Context) -> String {
          [updates #id] when it corrects an earlier note, and\n\
          [at YYYY-MM-DDTHH:MM] (optionally \"until HH:MM\") for a reminder.\n\n\
          Notebook folder: $MEMORY_DIR, or ~/.optmem/memory when that is unset.\n\
-         Summarizer: the program named by $MNEM_SUMMARIZER; without one, the agent\n\
-         is asked to write summaries itself."
+         Model: the program named by $MNEM_MODEL writes summaries and dreams;\n\
+         without one, the agent is asked to write summaries itself."
     )
 }
 
@@ -305,7 +315,7 @@ enum Summaries {
 
 impl Summaries {
     fn of(context: &Context, notebook: &Notebook) -> Self {
-        if context.summarizer.is_none() {
+        if context.model.is_none() {
             return Self::ByAgent;
         }
         match compactor::failure(notebook.dir()) {
@@ -966,9 +976,9 @@ fn compact(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
     if !args.is_empty() {
         return Err(usage_error(context, "compact"));
     }
-    let Some(summarizer) = &context.summarizer else {
+    let Some(summarizer) = &context.model else {
         return Err(Failure::Said(format!(
-            "No summarizer is set. Name the program in MNEM_SUMMARIZER, or write the summaries with: {} nap",
+            "No model program is set. Name it in MNEM_MODEL, or write the summaries with: {} nap",
             context.me
         )));
     };
@@ -1020,6 +1030,63 @@ fn compact(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
         Reply::refused(&out)
     } else {
         Reply::done(&out)
+    })
+}
+
+fn dream(context: &Context, notebook: &Notebook, args: &[&str]) -> Outcome {
+    let form = "dream <nightly|idle|compact>";
+    let [name] = args else {
+        return Err(usage_error(context, form));
+    };
+    let trigger = Trigger::named(name).ok_or_else(|| usage_error(context, form))?;
+    let mut model = context.model.clone();
+    let model: Option<&mut dyn Model> = match &mut model {
+        Some(model) => Some(model),
+        None => None,
+    };
+    let outcome = dream::run(notebook, model, trigger, context.now)?;
+    let failed = |message: String| Reply::failed(&message);
+    Ok(match outcome {
+        dream::Outcome::Busy => {
+            Reply::done(&["A dream is already running on this notebook.".to_owned()])
+        }
+        dream::Outcome::Dreamed {
+            first,
+            end,
+            dropped,
+            flagged,
+        } => Reply::done(&[format!(
+            "Dreamed over notes #{first} to #{}: MIND.md is rewritten. Code dropped {} and flagged {}; see {}.",
+            end.saturating_sub(1),
+            count(u64::try_from(dropped).unwrap_or(u64::MAX), "line", "lines"),
+            count(u64::try_from(flagged).unwrap_or(u64::MAX), "line", "lines"),
+            dream::LOG
+        )]),
+        dream::Outcome::Tidied { new, dropped } => {
+            let why = if context.model.is_none() {
+                "no model program is set in MNEM_MODEL".to_owned()
+            } else {
+                format!(
+                    "{} new, and {name} dreams need {}",
+                    count(new, "note is", "notes are"),
+                    trigger.min_new()
+                )
+            };
+            Reply::done(&[format!(
+                "No dream: {why}. Expired {} from MIND.md.",
+                count(u64::try_from(dropped).unwrap_or(u64::MAX), "line", "lines")
+            )])
+        }
+        dream::Outcome::Declined => Reply::done(&[
+            "The model declined to dream; MIND.md is unchanged and the notes wait for the next dream.".to_owned(),
+        ]),
+        dream::Outcome::Rejected(why) => failed(format!(
+            "The model's draft was rejected ({why}); MIND.md is unchanged. See {}.",
+            dream::LOG
+        )),
+        dream::Outcome::Unavailable(why) => failed(format!(
+            "The model could not be reached ({why}); MIND.md is unchanged."
+        )),
     })
 }
 
@@ -1147,6 +1214,7 @@ mod tests {
     use crate::config::Config;
     use crate::day::Day;
     use crate::model::CommandModel;
+    use crate::tags;
     use crate::testing::Scratch;
 
     fn context(scratch: &Scratch) -> Context {
@@ -1155,7 +1223,8 @@ mod tests {
             me: "mnem".to_owned(),
             home: None,
             today: Day::try_new("2026-10-31").expect("a real date"),
-            summarizer: None,
+            now: tags::date_time("2026-10-31T09:00").expect("a real time"),
+            model: None,
         }
     }
 
@@ -1781,7 +1850,7 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&program, permissions).expect("executable");
         Context {
-            summarizer: Some(CommandModel::new(program, Duration::from_secs(30))),
+            model: Some(CommandModel::new(program, Duration::from_secs(30))),
             ..context
         }
     }
@@ -1826,7 +1895,7 @@ mod tests {
         ok(&context, &["note", "one"]);
         ok(&context, &["note", "two"]);
         let broken = Context {
-            summarizer: Some(CommandModel::new(
+            model: Some(CommandModel::new(
                 scratch.path.join("absent"),
                 Duration::from_secs(1),
             )),
@@ -1871,12 +1940,34 @@ mod tests {
             "and the agent is left alone again"
         );
         let without = Context {
-            summarizer: None,
+            model: None,
             ..context
         };
         assert!(
-            fails(&without, &["compact"]).contains("No summarizer is set"),
+            fails(&without, &["compact"]).contains("No model program is set"),
             "none set"
+        );
+    }
+
+    #[test]
+    fn dream_explains_why_it_did_not_call_the_model() {
+        let scratch = Scratch::new();
+        let context = notebook_with(&scratch, 2);
+        assert_eq!(
+            ok(&context, &["dream", "nightly"]),
+            "No dream: no model program is set in MNEM_MODEL. Expired 0 lines from MIND.md.\n",
+            "without a model"
+        );
+        let with_model = with_summarizer(&scratch, "unused");
+        assert_eq!(
+            ok(&with_model, &["dream", "idle"]),
+            "No dream: 2 notes are new, and idle dreams need 4. Expired 0 lines from MIND.md.\n",
+            "too few notes"
+        );
+        assert!(
+            fails(&context, &["dream", "weekly"])
+                .contains("usage: mnem dream <nightly|idle|compact>"),
+            "an unknown trigger"
         );
     }
 
