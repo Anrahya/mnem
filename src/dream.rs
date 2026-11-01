@@ -859,14 +859,29 @@ pub fn read_watermark(dir: &Path) -> Result<u64, NotebookError> {
     }
 }
 
-/// MIND.md's text, if there is one.
+/// MIND.md's text, if there is one. A file over [`mind::FILE_MAX`], which
+/// Mnem never writes, is refused without being read whole.
 pub fn read_mind(dir: &Path) -> Result<Option<String>, NotebookError> {
     let path = dir.join(mind::FILE);
-    match fs::read_to_string(&path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(io_error(&path, source)),
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io_error(&path, source)),
+    };
+    let mut text = String::new();
+    let past = u64::try_from(mind::FILE_MAX)
+        .map_err(|_too_wide| NotebookError::Overflow)?
+        .saturating_add(1);
+    file.take(past)
+        .read_to_string(&mut text)
+        .map_err(|source| io_error(&path, source))?;
+    if text.len() > mind::FILE_MAX {
+        return Err(NotebookError::TooLarge {
+            path,
+            limit: mind::FILE_MAX,
+        });
     }
+    Ok(Some(text))
 }
 
 /// Appends `entry` to the log, dropping its oldest entries when it is

@@ -57,10 +57,10 @@ use crate::text::TEXT_MAX;
 use crate::text::Text;
 use crate::text::TextError;
 
-/// How large a compiled `recall` pattern may grow. Patterns such as
-/// `\w{1000}` expand far past the regex crate's default limit, because `\w`
-/// covers all of Unicode.
-pub(crate) const RECALL_REGEX_BYTES: usize = 256 << 20;
+/// How large a compiled `recall` pattern may grow, which bounds the time
+/// compiling it takes. `\w` covers all of Unicode, so `\w{50}` fits and
+/// `\w{100}` does not; ordinary patterns are far smaller.
+pub(crate) const RECALL_REGEX_BYTES: usize = 4 << 20;
 
 /// How many of the latest notes a new note is compared with to spot a
 /// repeat, so writing a note stays fast however long the log grows.
@@ -680,10 +680,12 @@ impl From<NotebookError> for MemoryError {
                 source: io::Error::new(io::ErrorKind::NotFound, "no notebook here"),
                 path: dir,
             },
-            NotebookError::Corrupt { ref path, .. } => Self::Corrupt {
-                path: path.clone(),
-                detail: error.to_string(),
-            },
+            NotebookError::Corrupt { ref path, .. } | NotebookError::TooLarge { ref path, .. } => {
+                Self::Corrupt {
+                    path: path.clone(),
+                    detail: error.to_string(),
+                }
+            }
             NotebookError::Config(_) => Self::Corrupt {
                 path: PathBuf::from("config"),
                 detail: error.to_string(),
@@ -1037,6 +1039,39 @@ mod tests {
                 .apply_dream(&job.id, reply(&draft("eggs", "Omelette")), now)
                 .is_ok(),
             "the same apply goes through once the lock is free"
+        );
+    }
+
+    #[test]
+    fn an_oversized_mind_is_corrupt_and_not_read() {
+        let scratch = Scratch::new();
+        let memory = memory(&scratch, &NOTES);
+        let path = scratch.path.join(crate::mind::FILE);
+        std::fs::write(&path, "x".repeat(crate::mind::FILE_MAX + 1)).expect("written");
+        assert!(
+            matches!(memory.mind(), Err(MemoryError::Corrupt { .. })),
+            "a MIND.md larger than Mnem writes is refused"
+        );
+        let agenda = memory
+            .agenda(at("2026-10-31T03:00"))
+            .expect("the agenda still reads");
+        assert_eq!(agenda.problems.len(), 1, "and reports it: {agenda:?}");
+    }
+
+    #[test]
+    fn recall_patterns_are_bounded() {
+        let scratch = Scratch::new();
+        let memory = memory(&scratch, &NOTES);
+        assert!(
+            memory.recall(r"\w{50}", 10).is_ok(),
+            "an ordinary long pattern compiles"
+        );
+        assert!(
+            matches!(
+                memory.recall(r"(\w{50}){40}", 10),
+                Err(MemoryError::Invalid { .. })
+            ),
+            "a pattern that compiles huge is refused"
         );
     }
 

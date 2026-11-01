@@ -65,8 +65,8 @@ impl Agenda {
             ledger: fired::read(dir)?,
             ..Self::default()
         };
-        if let Some(text) = dream::read_mind(dir)? {
-            match mind::parse(&text) {
+        match dream::read_mind(dir) {
+            Ok(Some(text)) => match mind::parse(&text) {
                 Ok((mind, _)) => {
                     agenda.items.extend(mind.nudges.iter().cloned());
                     agenda.mind = Some(mind);
@@ -74,7 +74,12 @@ impl Agenda {
                 Err(missing) => agenda.problems.push(format!(
                     "MIND.md cannot be read ({missing}), so its nudges are not listed."
                 )),
-            }
+            },
+            Ok(None) => {}
+            Err(error @ NotebookError::TooLarge { .. }) => agenda
+                .problems
+                .push(format!("{error}, so its nudges are not listed.")),
+            Err(error) => return Err(error),
         }
         let mut reminders = Vec::new();
         for (id, reminder) in agenda.index.reminders() {
