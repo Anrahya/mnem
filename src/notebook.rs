@@ -84,6 +84,8 @@ pub enum NotebookError {
     NotABlock { note: Span },
     /// A position or size does not fit in 64 bits.
     Overflow,
+    /// A file is larger than Mnem ever writes it, so it was not read.
+    TooLarge { path: PathBuf, limit: usize },
 }
 
 impl Notebook {
@@ -562,8 +564,16 @@ impl fmt::Display for NotebookError {
             }
             Self::NotABlock { note } => write!(f, "note {note} is a single note, not a block"),
             Self::Overflow => write!(f, "a position in the notebook does not fit in 64 bits"),
+            Self::TooLarge { path, limit } => {
+                write!(f, "{} {}", path.display(), too_large(*limit))
+            }
         }
     }
+}
+
+/// Why a file over `limit` bytes was not read, without its path.
+pub(crate) fn too_large(limit: usize) -> String {
+    format!("is over {limit} bytes, more than Mnem ever writes; it was not read")
 }
 
 impl Error for NotebookError {
@@ -577,7 +587,8 @@ impl Error for NotebookError {
             | Self::BackwardRange { .. }
             | Self::BeyondLog { .. }
             | Self::NotABlock { .. }
-            | Self::Overflow => None,
+            | Self::Overflow
+            | Self::TooLarge { .. } => None,
         }
     }
 }

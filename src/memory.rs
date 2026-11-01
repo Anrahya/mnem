@@ -46,6 +46,7 @@ use crate::mind;
 use crate::mind::Mind;
 use crate::mind::Nudge;
 use crate::model::Answer;
+use crate::notebook;
 use crate::notebook::Notebook;
 use crate::notebook::NotebookError;
 use crate::record::Note;
@@ -57,10 +58,10 @@ use crate::text::TEXT_MAX;
 use crate::text::Text;
 use crate::text::TextError;
 
-/// How large a compiled `recall` pattern may grow. Patterns such as
-/// `\w{1000}` expand far past the regex crate's default limit, because `\w`
-/// covers all of Unicode.
-pub(crate) const RECALL_REGEX_BYTES: usize = 256 << 20;
+/// How large a compiled `recall` pattern may grow, which bounds the time
+/// compiling it takes. `\w` covers all of Unicode, so `\w{50}` fits and
+/// `\w{100}` does not; ordinary patterns are far smaller.
+pub(crate) const RECALL_REGEX_BYTES: usize = 4 << 20;
 
 /// How many of the latest notes a new note is compared with to spot a
 /// repeat, so writing a note stays fast however long the log grows.
@@ -684,6 +685,10 @@ impl From<NotebookError> for MemoryError {
                 path: path.clone(),
                 detail: error.to_string(),
             },
+            NotebookError::TooLarge { path, limit } => Self::Corrupt {
+                path,
+                detail: notebook::too_large(limit),
+            },
             NotebookError::Config(_) => Self::Corrupt {
                 path: PathBuf::from("config"),
                 detail: error.to_string(),
@@ -1037,6 +1042,55 @@ mod tests {
                 .apply_dream(&job.id, reply(&draft("eggs", "Omelette")), now)
                 .is_ok(),
             "the same apply goes through once the lock is free"
+        );
+    }
+
+    #[test]
+    fn an_oversized_mind_is_corrupt_and_the_next_dream_replaces_it() {
+        let scratch = Scratch::new();
+        let memory = memory(&scratch, &NOTES);
+        let path = scratch.path.join(crate::mind::FILE);
+        // One byte, then three-byte characters, so the read stops inside one.
+        let text = format!("x{}", "あ".repeat(crate::mind::FILE_MAX / 3 + 1));
+        assert!(
+            !text.is_char_boundary(crate::mind::FILE_MAX + 1),
+            "the read must stop inside a character to test the cut"
+        );
+        std::fs::write(&path, text).expect("written");
+        assert!(
+            matches!(memory.mind(), Err(MemoryError::Corrupt { .. })),
+            "a MIND.md larger than Mnem writes is refused, whatever it holds"
+        );
+        let now = at("2026-10-31T03:00");
+        let agenda = memory.agenda(now).expect("the agenda still reads");
+        assert_eq!(agenda.problems.len(), 1, "and reports it: {agenda:?}");
+        let job = memory
+            .dream_job(Trigger::Nightly, None, now)
+            .expect("a dream is not blocked by it")
+            .expect("five new notes");
+        memory
+            .apply_dream(&job.id, reply(&draft("eggs", "Suggest an omelette")), now)
+            .expect("applied");
+        assert!(
+            memory.mind().expect("read").is_some(),
+            "the dream replaced the oversized file"
+        );
+    }
+
+    #[test]
+    fn recall_patterns_are_bounded() {
+        let scratch = Scratch::new();
+        let memory = memory(&scratch, &NOTES);
+        assert!(
+            memory.recall(r"\w{50}", 10).is_ok(),
+            "an ordinary long pattern compiles"
+        );
+        assert!(
+            matches!(
+                memory.recall(r"(\w{50}){40}", 10),
+                Err(MemoryError::Invalid { .. })
+            ),
+            "a pattern that compiles huge is refused"
         );
     }
 

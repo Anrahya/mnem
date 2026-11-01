@@ -60,6 +60,11 @@ const ID_MAX: usize = 32;
 /// session start and fed back into every dream.
 pub const LINE_MAX: usize = 400;
 
+/// The largest MIND.md, in bytes. Every file Mnem writes fits: at most 75
+/// lines of [`LINE_MAX`] bytes, each with its bullet and cadence, and the
+/// headings.
+pub const FILE_MAX: usize = 32 * 1024;
+
 /// The contents of MIND.md.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Mind {
@@ -645,6 +650,38 @@ mod tests {
 
     fn at(value: &str) -> DateTime {
         tags::date_time(value).expect("a valid time")
+    }
+
+    #[test]
+    fn the_largest_mind_fits_file_max() {
+        let line = "x".repeat(mind::LINE_MAX);
+        let biggest = Mind {
+            durable: vec![line.clone(); mind::DURABLE_MAX],
+            active: vec![line.clone(); mind::ACTIVE_MAX],
+            hunches: vec![
+                Hunch {
+                    cadence: Cadence::Weekly,
+                    text: line,
+                };
+                mind::HUNCHES_MAX
+            ],
+            nudges: vec![
+                Nudge {
+                    id: "n".to_owned(),
+                    when: When::NextSession,
+                    until: None,
+                    action: "x".repeat(mind::LINE_MAX - 40),
+                    why: "y".to_owned(),
+                    notify: true,
+                };
+                mind::NUDGES_MAX
+            ],
+        };
+        let size = mind::render(&biggest).len();
+        assert!(
+            size <= mind::FILE_MAX,
+            "every MIND.md Dream can write must be readable: {size} bytes"
+        );
     }
 
     fn facts(notes: &[(&str, &str)]) -> Facts {
