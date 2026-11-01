@@ -564,13 +564,16 @@ impl fmt::Display for NotebookError {
             }
             Self::NotABlock { note } => write!(f, "note {note} is a single note, not a block"),
             Self::Overflow => write!(f, "a position in the notebook does not fit in 64 bits"),
-            Self::TooLarge { path, limit } => write!(
-                f,
-                "{} is over {limit} bytes, larger than Mnem writes it; it was not read",
-                path.display()
-            ),
+            Self::TooLarge { path, limit } => {
+                write!(f, "{} {}", path.display(), too_large(*limit))
+            }
         }
     }
+}
+
+/// Why a file over `limit` bytes was not read, without its path.
+pub(crate) fn too_large(limit: usize) -> String {
+    format!("is over {limit} bytes, more than Mnem ever writes; it was not read")
 }
 
 impl Error for NotebookError {

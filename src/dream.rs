@@ -318,7 +318,7 @@ fn job_locked(
         let (new, dropped) = tidy_due(notebook, trigger, now)?;
         return Ok(Prepared::Tidied { new, dropped });
     }
-    let old_text = read_mind(dir)?;
+    let old_text = old_mind(dir, &mut Vec::new())?;
     let ledger = fired::read(dir)?;
     let end = len.min(watermark.saturating_add(NOTES_MAX));
     let facts = facts(notebook, end)?;
@@ -354,9 +354,9 @@ fn tidy_due(
     let dir = notebook.dir();
     let len = notebook.len()?;
     let new = len.saturating_sub(read_watermark(dir)?.min(len));
-    let old_text = read_mind(dir)?;
-    let ledger = fired::read(dir)?;
     let mut entry = vec![header(now, trigger)];
+    let old_text = old_mind(dir, &mut entry)?;
+    let ledger = fired::read(dir)?;
     let facts = facts(notebook, len)?;
     let dropped = tidy(dir, old_text.as_deref(), &facts, &ledger, now, &mut entry)?;
     if entry.len() > 1 {
@@ -390,9 +390,9 @@ fn apply_locked(
         )));
     }
     let (first, end) = (id.first, id.end);
-    let old_text = read_mind(dir)?;
-    let ledger = fired::read(dir)?;
     let mut entry = vec![header(now, id.trigger)];
+    let old_text = old_mind(dir, &mut entry)?;
+    let ledger = fired::read(dir)?;
     let reply = match answer {
         Answer::Reply(reply) => reply,
         Answer::Declined => {
@@ -868,20 +868,37 @@ pub fn read_mind(dir: &Path) -> Result<Option<String>, NotebookError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(io_error(&path, source)),
     };
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     let past = u64::try_from(mind::FILE_MAX)
         .map_err(|_too_wide| NotebookError::Overflow)?
         .saturating_add(1);
     file.take(past)
-        .read_to_string(&mut text)
+        .read_to_end(&mut bytes)
         .map_err(|source| io_error(&path, source))?;
-    if text.len() > mind::FILE_MAX {
+    // Check the size before decoding, which a cut through a character
+    // would fail.
+    if bytes.len() > mind::FILE_MAX {
         return Err(NotebookError::TooLarge {
             path,
             limit: mind::FILE_MAX,
         });
     }
+    let text = String::from_utf8(bytes)
+        .map_err(|error| io_error(&path, io::Error::new(io::ErrorKind::InvalidData, error)))?;
     Ok(Some(text))
+}
+
+/// MIND.md's text for a dream. One too large to be Dream's is read as no
+/// file, and noted in `entry`, so the dream replaces it instead of failing
+/// on it every night.
+fn old_mind(dir: &Path, entry: &mut Vec<String>) -> Result<Option<String>, NotebookError> {
+    match read_mind(dir) {
+        Err(error @ NotebookError::TooLarge { .. }) => {
+            entry.push(format!("{error}; the dream replaces it"));
+            Ok(None)
+        }
+        read => read,
+    }
 }
 
 /// Appends `entry` to the log, dropping its oldest entries when it is

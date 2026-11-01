@@ -76,9 +76,9 @@ impl Agenda {
                 )),
             },
             Ok(None) => {}
-            Err(error @ NotebookError::TooLarge { .. }) => agenda
-                .problems
-                .push(format!("{error}, so its nudges are not listed.")),
+            Err(error @ NotebookError::TooLarge { .. }) => agenda.problems.push(format!(
+                "{error}, so its nudges are not listed; the next dream replaces it."
+            )),
             Err(error) => return Err(error),
         }
         let mut reminders = Vec::new();

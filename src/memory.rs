@@ -46,6 +46,7 @@ use crate::mind;
 use crate::mind::Mind;
 use crate::mind::Nudge;
 use crate::model::Answer;
+use crate::notebook;
 use crate::notebook::Notebook;
 use crate::notebook::NotebookError;
 use crate::record::Note;
@@ -680,12 +681,14 @@ impl From<NotebookError> for MemoryError {
                 source: io::Error::new(io::ErrorKind::NotFound, "no notebook here"),
                 path: dir,
             },
-            NotebookError::Corrupt { ref path, .. } | NotebookError::TooLarge { ref path, .. } => {
-                Self::Corrupt {
-                    path: path.clone(),
-                    detail: error.to_string(),
-                }
-            }
+            NotebookError::Corrupt { ref path, .. } => Self::Corrupt {
+                path: path.clone(),
+                detail: error.to_string(),
+            },
+            NotebookError::TooLarge { path, limit } => Self::Corrupt {
+                path,
+                detail: notebook::too_large(limit),
+            },
             NotebookError::Config(_) => Self::Corrupt {
                 path: PathBuf::from("config"),
                 detail: error.to_string(),
@@ -1043,19 +1046,35 @@ mod tests {
     }
 
     #[test]
-    fn an_oversized_mind_is_corrupt_and_not_read() {
+    fn an_oversized_mind_is_corrupt_and_the_next_dream_replaces_it() {
         let scratch = Scratch::new();
         let memory = memory(&scratch, &NOTES);
         let path = scratch.path.join(crate::mind::FILE);
-        std::fs::write(&path, "x".repeat(crate::mind::FILE_MAX + 1)).expect("written");
+        // One byte, then three-byte characters, so the read stops inside one.
+        let text = format!("x{}", "あ".repeat(crate::mind::FILE_MAX / 3 + 1));
+        assert!(
+            !text.is_char_boundary(crate::mind::FILE_MAX + 1),
+            "the read must stop inside a character to test the cut"
+        );
+        std::fs::write(&path, text).expect("written");
         assert!(
             matches!(memory.mind(), Err(MemoryError::Corrupt { .. })),
-            "a MIND.md larger than Mnem writes is refused"
+            "a MIND.md larger than Mnem writes is refused, whatever it holds"
         );
-        let agenda = memory
-            .agenda(at("2026-10-31T03:00"))
-            .expect("the agenda still reads");
+        let now = at("2026-10-31T03:00");
+        let agenda = memory.agenda(now).expect("the agenda still reads");
         assert_eq!(agenda.problems.len(), 1, "and reports it: {agenda:?}");
+        let job = memory
+            .dream_job(Trigger::Nightly, None, now)
+            .expect("a dream is not blocked by it")
+            .expect("five new notes");
+        memory
+            .apply_dream(&job.id, reply(&draft("eggs", "Suggest an omelette")), now)
+            .expect("applied");
+        assert!(
+            memory.mind().expect("read").is_some(),
+            "the dream replaced the oversized file"
+        );
     }
 
     #[test]
