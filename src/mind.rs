@@ -281,6 +281,17 @@ pub fn is_reminder_id(id: &str) -> bool {
 
 /// MIND.md's text for `mind`. [`parse`] reads it back unchanged.
 pub fn render(mind: &Mind) -> String {
+    let mut out = render_without_nudges(mind);
+    out.push_str("\n## Nudges\n");
+    for nudge in &mind.nudges {
+        out.push_str(&format!("- {}\n", nudge_line(nudge)));
+    }
+    out
+}
+
+/// [`render`] without the Nudges section, for an agent that talks with the
+/// user but does not act on nudges.
+pub fn render_without_nudges(mind: &Mind) -> String {
     let mut out = String::from(
         "# MIND\n\n\
          Written by Mnem's Dream from the notebook. Each line cites the notes it\n\
@@ -297,10 +308,6 @@ pub fn render(mind: &Mind) -> String {
     out.push_str("\n## Hunches\n");
     for hunch in &mind.hunches {
         out.push_str(&format!("- {}\n", hunch_line(hunch)));
-    }
-    out.push_str("\n## Nudges\n");
-    for nudge in &mind.nudges {
-        out.push_str(&format!("- {}\n", nudge_line(nudge)));
     }
     out
 }

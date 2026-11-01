@@ -4,8 +4,6 @@
 //! that already fired. Entries older than [`KEEP_DAYS`] are pruned.
 
 use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
 
@@ -13,6 +11,7 @@ use jiff::Span;
 use jiff::civil::DateTime;
 
 use crate::files;
+use crate::files::Lock;
 use crate::notebook::NotebookError;
 use crate::tags;
 
@@ -30,23 +29,14 @@ const LOCK: &str = ".fired.lock";
 /// Dropping it releases the lock.
 #[derive(Debug)]
 pub struct Held {
-    _file: File,
+    _lock: Lock,
 }
 
 /// Waits for the ledger's lock and takes it.
 pub fn hold(dir: &Path) -> Result<Held, NotebookError> {
-    let path = dir.join(LOCK);
-    let io_error = |source| NotebookError::Io {
-        path: path.clone(),
-        source,
-    };
-    let file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&path)
-        .map_err(io_error)?;
-    file.lock().map_err(io_error)?;
-    Ok(Held { _file: file })
+    Ok(Held {
+        _lock: Lock::wait(&dir.join(LOCK))?,
+    })
 }
 
 /// Records that each of `handed` (an id, and the time it was due if it was

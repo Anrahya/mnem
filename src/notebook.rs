@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use crate::config::Config;
 use crate::config::ConfigError;
 use crate::day::Day;
+use crate::files::Lock;
 use crate::record;
 use crate::record::LOG_REC;
 use crate::record::Note;
@@ -117,6 +118,26 @@ impl Notebook {
             dir: dir.to_path_buf(),
             config,
         })
+    }
+
+    /// Opens an existing notebook without creating anything in it. A
+    /// directory without `LOG.txt` is not a notebook yet.
+    pub fn open_read_only(dir: &Path) -> Result<Self, NotebookError> {
+        if !Self::exists(dir) {
+            return Err(NotebookError::Missing {
+                dir: dir.to_path_buf(),
+            });
+        }
+        let config = Config::read(dir).map_err(NotebookError::Config)?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            config,
+        })
+    }
+
+    /// Whether `dir` holds a notebook: a directory with `LOG.txt` in it.
+    pub fn exists(dir: &Path) -> bool {
+        dir.join("LOG.txt").is_file()
     }
 
     /// The notebook's size settings, as read when it was opened.
@@ -368,23 +389,9 @@ impl Notebook {
         self.dir.join("TREE").join(block.size().to_string())
     }
 
-    /// Takes the notebook's exclusive write lock, held until the returned
-    /// file is dropped. Opening for append leaves the file's contents as they
-    /// are, so opening it never touches a lock someone else holds.
-    fn lock(&self) -> Result<File, NotebookError> {
-        let path = self.dir.join(".lock");
-        let file = OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(&path)
-            .map_err(|source| io_error(&path, source))?;
-        loop {
-            match file.lock() {
-                Ok(()) => return Ok(file),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(source) => return Err(io_error(&path, source)),
-            }
-        }
+    /// Takes the notebook's exclusive write lock, held until it is dropped.
+    fn lock(&self) -> Result<Lock, NotebookError> {
+        Lock::wait(&self.dir.join(".lock"))
     }
 }
 
