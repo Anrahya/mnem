@@ -7,7 +7,8 @@
 //! the id of what it is for), which the harness sends to its model however
 //! it likes, and an apply, which checks the answer before anything touches
 //! disk. A stale job is refused with [`MemoryError::Conflict`], and an apply
-//! retried after it succeeded settles without writing twice.
+//! retried after it succeeded settles without writing twice. While a dream
+//! runs, another is refused with [`MemoryError::Busy`]; ask again later.
 //!
 //! Notes carry their author as a leading `[by <author>]`, so several agents
 //! can share one notebook and the notebook format stays OptMem's.
@@ -30,6 +31,7 @@ use regex::RegexBuilder;
 use crate::compactor;
 use crate::compactor::SummaryId;
 use crate::compactor::SummaryJob;
+use crate::config::Config;
 use crate::cover;
 use crate::day::Day;
 use crate::dream;
@@ -50,6 +52,8 @@ use crate::record::Note;
 use crate::simhash;
 use crate::span::Span;
 use crate::tags;
+use crate::text;
+use crate::text::TEXT_MAX;
 use crate::text::Text;
 use crate::text::TextError;
 
@@ -65,10 +69,17 @@ pub(crate) const REPEAT_WINDOW: u64 = 4096;
 /// The longest author name, in bytes.
 pub const AUTHOR_MAX: usize = 32;
 
+/// The longest note a new notebook takes, in bytes, its `[by …]` prefix
+/// included. A notebook's `config` may lower it; [`Memory::entry_chars`]
+/// gives the limit in force.
+pub const ENTRY_CHARS: usize = TEXT_MAX;
+
 /// One notebook, opened for a harness.
 #[derive(Debug)]
 pub struct Memory {
     notebook: Notebook,
+    /// False when opened with [`Memory::open_read_only`].
+    writable: bool,
 }
 
 /// Why a call failed.
@@ -80,6 +91,9 @@ pub enum MemoryError {
     /// The job is stale: the notebook moved on since it was made. Ask for
     /// the current job.
     Conflict { message: String },
+    /// Another process is doing the same work on this notebook, such as a
+    /// dream; ask again later. Nothing was changed.
+    Busy { message: String },
     /// A file in the notebook cannot be read as Mnem wrote it.
     Corrupt { path: PathBuf, detail: String },
     /// A file operation failed.
@@ -135,6 +149,28 @@ pub struct MindView {
     pub mind: Mind,
 }
 
+/// A rendering of MIND.md and its revision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MindText {
+    /// A digest of `text`, in hex: it changes only when `text` does.
+    pub revision: String,
+    /// The rendered text.
+    pub text: String,
+}
+
+impl MindView {
+    /// MIND.md without its Nudges section, for agents that talk with the
+    /// user but do not act on nudges. Its revision is its own, so a change to
+    /// the nudges alone leaves it as it was.
+    pub fn without_nudges(&self) -> MindText {
+        let text = mind::render_without_nudges(&self.mind);
+        MindText {
+            revision: revision(&text),
+            text,
+        }
+    }
+}
+
 /// What the heartbeat should schedule, as of a time. Fired and stale items
 /// are left out, and two items for one intent never both appear.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -155,19 +191,58 @@ impl Memory {
     pub fn create(dir: &Path) -> Result<Self, MemoryError> {
         Ok(Self {
             notebook: Notebook::init(dir).map_err(|error| opening(dir, error))?,
+            writable: true,
         })
+    }
+
+    /// Writes the first note to the notebook at `dir`, creating the notebook
+    /// only once the note is known to be valid: a refused note leaves no
+    /// notebook behind. On an existing notebook it is [`Memory::note`]. An
+    /// I/O failure after the notebook was created can leave it empty.
+    pub fn create_with_note(
+        dir: &Path,
+        author: &str,
+        text: &str,
+        now: DateTime,
+    ) -> Result<(Self, NoteOutcome), MemoryError> {
+        if !Notebook::exists(dir) {
+            // A `config` placed before the first note sets the limit.
+            let config =
+                Config::read(dir).map_err(|error| opening(dir, NotebookError::Config(error)))?;
+            checked_note(author, text, config.entry_chars(), 0, now)?;
+        }
+        let memory = Self::create(dir)?;
+        let outcome = memory.note(author, text, now)?;
+        Ok((memory, outcome))
     }
 
     /// Opens the existing notebook at `dir`.
     pub fn open(dir: &Path) -> Result<Self, MemoryError> {
         Ok(Self {
             notebook: Notebook::open(dir).map_err(|error| opening(dir, error))?,
+            writable: true,
+        })
+    }
+
+    /// Opens the existing notebook at `dir` for reading only: opening
+    /// creates nothing, and calls that write are refused with
+    /// [`MemoryError::Invalid`].
+    pub fn open_read_only(dir: &Path) -> Result<Self, MemoryError> {
+        Ok(Self {
+            notebook: Notebook::open_read_only(dir).map_err(|error| opening(dir, error))?,
+            writable: false,
         })
     }
 
     /// The notebook's directory.
     pub fn dir(&self) -> &Path {
         self.notebook.dir()
+    }
+
+    /// The longest note this notebook takes, in bytes, its `[by …]` prefix
+    /// included.
+    pub fn entry_chars(&self) -> usize {
+        self.notebook.config().entry_chars()
     }
 
     /// Writes `text` as a note by `author`, dated `now`. Its tags are checked
@@ -178,14 +253,9 @@ impl Memory {
         text: &str,
         now: DateTime,
     ) -> Result<NoteOutcome, MemoryError> {
-        let author = checked_author(author)?;
-        let limit = self.notebook.config().entry_chars();
-        let full = format!("[by {author}] {text}");
-        let text =
-            Text::try_new(&full, limit).map_err(|error| invalid(note_problem(&error, limit)))?;
-        let found = checked_tags(text.as_str(), self.notebook.len()?).map_err(invalid)?;
-        let day = Day::try_new(&now.date().to_string())
-            .map_err(|_not_a_day| invalid(format!("{now} cannot date a note")))?;
+        self.writable()?;
+        let (text, found, day) =
+            checked_note(author, text, self.entry_chars(), self.notebook.len()?, now)?;
         let print = simhash::fingerprint(strip_author(text.as_str()).1);
         let id = self.notebook.append(&[(day, text)])?;
         let mut warnings = Vec::new();
@@ -305,7 +375,7 @@ impl Memory {
             detail: missing.to_string(),
         })?;
         Ok(Some(MindView {
-            revision: format!("{:016x}", simhash::fnv1a(&text)),
+            revision: revision(&text),
             text,
             mind,
         }))
@@ -314,6 +384,7 @@ impl Memory {
     /// The next summary due, if any: send its prompt to a model, then pass
     /// the answer to [`Memory::apply_compaction`].
     pub fn compaction_job(&self) -> Result<Option<SummaryJob>, MemoryError> {
+        self.writable()?;
         match compactor::next_job(&self.notebook)? {
             compactor::Next::Done => Ok(None),
             compactor::Next::Job(job) => Ok(Some(job)),
@@ -333,6 +404,7 @@ impl Memory {
         id: &SummaryId,
         answer: Answer,
     ) -> Result<compactor::Applied, MemoryError> {
+        self.writable()?;
         compactor::apply(&self.notebook, id, answer).map_err(|error| match error {
             compactor::ApplyError::Stale(message) => MemoryError::Conflict { message },
             compactor::ApplyError::Invalid(message) => MemoryError::Invalid { message },
@@ -350,6 +422,7 @@ impl Memory {
         user: Option<&str>,
         now: DateTime,
     ) -> Result<Option<DreamJob>, MemoryError> {
+        self.writable()?;
         match dream::job(&self.notebook, trigger, user, now)? {
             Prepared::Tidied { .. } => Ok(None),
             Prepared::Job(job) => Ok(Some(job)),
@@ -368,6 +441,7 @@ impl Memory {
         answer: Answer,
         now: DateTime,
     ) -> Result<dream::Report, MemoryError> {
+        self.writable()?;
         dream::apply(&self.notebook, id, answer, now).map_err(|error| match error {
             dream::ApplyError::Stale(message) => MemoryError::Conflict { message },
             dream::ApplyError::Busy => dreaming(),
@@ -379,6 +453,7 @@ impl Memory {
     /// are written again. Returns the blocks forgotten. Notes are never
     /// forgotten.
     pub fn forget(&self, block: Span) -> Result<Vec<Span>, MemoryError> {
+        self.writable()?;
         Ok(self.notebook.forget(block)?)
     }
 
@@ -406,6 +481,7 @@ impl Memory {
         due: Option<DateTime>,
         at: DateTime,
     ) -> Result<(), MemoryError> {
+        self.writable()?;
         if id.is_empty() || id.contains(char::is_whitespace) {
             return Err(invalid(format!(
                 "{id:?} is not an item id: use the id from the agenda, such as \"call-mom\" or \"r12\"."
@@ -428,6 +504,41 @@ impl Memory {
         })?;
         Ok(())
     }
+
+    fn writable(&self) -> Result<(), MemoryError> {
+        if self.writable {
+            return Ok(());
+        }
+        Err(invalid(format!(
+            "{} was opened read-only; open it with Memory::open to write.",
+            self.dir().display()
+        )))
+    }
+}
+
+/// A note by `author` checked for a notebook that takes `limit` bytes and
+/// holds `before` notes: its full text, its tags and its day.
+fn checked_note(
+    author: &str,
+    text: &str,
+    limit: usize,
+    before: u64,
+    now: DateTime,
+) -> Result<(Text, tags::Tags, Day), MemoryError> {
+    let author = checked_author(author)?;
+    if text.trim_matches(text::is_python_space).is_empty() {
+        return Err(invalid(note_problem(&TextError::Empty, limit)));
+    }
+    let full = format!("[by {author}] {text}");
+    let text = Text::try_new(&full, limit).map_err(|error| invalid(note_problem(&error, limit)))?;
+    let found = checked_tags(text.as_str(), before).map_err(invalid)?;
+    let day = Day::try_new(&now.date().to_string())
+        .map_err(|_not_a_day| invalid(format!("{now} cannot date a note")))?;
+    Ok((text, found, day))
+}
+
+fn revision(text: &str) -> String {
+    format!("{:016x}", simhash::fnv1a(text))
 }
 
 /// `text` split into its author and the rest, when it starts `[by <author>] `.
@@ -498,7 +609,7 @@ fn minute(time: DateTime) -> DateTime {
 }
 
 fn dreaming() -> MemoryError {
-    MemoryError::Conflict {
+    MemoryError::Busy {
         message: "another dream is running on this notebook; ask again when it ends".to_owned(),
     }
 }
@@ -591,7 +702,9 @@ impl From<NotebookError> for MemoryError {
 impl fmt::Display for MemoryError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Invalid { message } | Self::Conflict { message } => f.write_str(message),
+            Self::Invalid { message } | Self::Conflict { message } | Self::Busy { message } => {
+                f.write_str(message)
+            }
             Self::Corrupt { path, detail } => write!(f, "{}: {detail}", path.display()),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
         }
@@ -602,7 +715,10 @@ impl Error for MemoryError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Invalid { .. } | Self::Conflict { .. } | Self::Corrupt { .. } => None,
+            Self::Invalid { .. }
+            | Self::Conflict { .. }
+            | Self::Busy { .. }
+            | Self::Corrupt { .. } => None,
         }
     }
 }
@@ -890,6 +1006,11 @@ mod tests {
     fn a_dream_never_waits_for_another() {
         let scratch = Scratch::new();
         let memory = memory(&scratch, &NOTES);
+        let now = at("2026-10-31T03:00");
+        let job = memory
+            .dream_job(Trigger::Nightly, None, now)
+            .expect("job")
+            .expect("five new notes");
         let held = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
@@ -898,12 +1019,158 @@ mod tests {
         held.lock().expect("lock");
         assert!(
             matches!(
-                memory.dream_job(Trigger::Nightly, None, at("2026-10-31T03:00")),
-                Err(MemoryError::Conflict { .. })
+                memory.dream_job(Trigger::Nightly, None, now),
+                Err(MemoryError::Busy { .. })
             ),
-            "busy is a conflict, not a wait"
+            "a held lock makes a new job busy, not a wait"
+        );
+        assert!(
+            matches!(
+                memory.apply_dream(&job.id, reply(&draft("eggs", "Omelette")), now),
+                Err(MemoryError::Busy { .. })
+            ),
+            "a held lock makes an apply busy, not a conflict"
         );
         held.unlock().expect("unlock");
+        assert!(
+            memory
+                .apply_dream(&job.id, reply(&draft("eggs", "Omelette")), now)
+                .is_ok(),
+            "the same apply goes through once the lock is free"
+        );
+    }
+
+    #[test]
+    fn a_blank_note_is_refused() {
+        let scratch = Scratch::new();
+        let memory = memory(&scratch, &[]);
+        for text in ["", "   ", "\u{1c}\u{1f}"] {
+            assert!(
+                matches!(
+                    memory.note("Arcee", text, at("2026-10-31T09:00")),
+                    Err(MemoryError::Invalid { .. })
+                ),
+                "the author prefix alone is not a note: {text:?}"
+            );
+        }
+        assert_eq!(
+            memory.recall(".", 10).expect("recall").len(),
+            0,
+            "nothing was written"
+        );
+    }
+
+    #[test]
+    fn a_refused_first_note_creates_no_notebook() {
+        let scratch = Scratch::new();
+        let dir = scratch.path.join("person").join("mnem");
+        let long = "x".repeat(super::ENTRY_CHARS);
+        for text in ["", long.as_str(), "[updates #0] nothing to update"] {
+            assert!(
+                matches!(
+                    Memory::create_with_note(&dir, "Arcee", text, at("2026-10-31T09:00")),
+                    Err(MemoryError::Invalid { .. })
+                ),
+                "refused: {text:?}"
+            );
+            assert!(!dir.exists(), "no directory left behind for {text:?}");
+        }
+        let (memory, outcome) =
+            Memory::create_with_note(&dir, "Arcee", "Lives in Mumbai", at("2026-10-31T09:00"))
+                .expect("created");
+        assert_eq!(outcome.id, 0, "the first note");
+        assert_eq!(memory.entry_chars(), super::ENTRY_CHARS, "default limit");
+        let (_, again) =
+            Memory::create_with_note(&dir, "Scout", "Likes tea", at("2026-10-31T09:05"))
+                .expect("an existing notebook takes the note");
+        assert_eq!(again.id, 1, "appended, not recreated");
+
+        let seeded = scratch.path.join("seeded");
+        std::fs::create_dir_all(&seeded).expect("dir");
+        std::fs::write(seeded.join("config"), "ENTRY_CHARS=20\n").expect("config");
+        assert!(
+            matches!(
+                Memory::create_with_note(&seeded, "Arcee", &"x".repeat(30), at("2026-10-31T09:00")),
+                Err(MemoryError::Invalid { .. })
+            ),
+            "a seeded config's limit applies to the first note"
+        );
+        assert!(
+            !crate::notebook::Notebook::exists(&seeded) && !seeded.join("TREE").exists(),
+            "the refused note created no notebook in the seeded dir"
+        );
+    }
+
+    #[test]
+    fn a_read_only_open_creates_nothing_and_writes_nothing() {
+        let scratch = Scratch::new();
+        let missing = scratch.path.join("nobody");
+        assert!(
+            matches!(
+                Memory::open_read_only(&missing),
+                Err(MemoryError::Io { .. })
+            ),
+            "no notebook to open"
+        );
+        assert!(!missing.exists(), "opening created nothing");
+        drop(memory(&scratch, &NOTES));
+        std::fs::remove_dir_all(scratch.path.join("TREE")).expect("remove TREE");
+        let reader = Memory::open_read_only(&scratch.path).expect("opened");
+        assert_eq!(
+            reader.recall("breakfast", 10).expect("recall").len(),
+            2,
+            "reads work"
+        );
+        assert!(reader.wake().is_ok(), "wake reads without TREE");
+        assert!(reader.zoom(block("0-1")).is_ok(), "zoom reads without TREE");
+        assert!(
+            matches!(
+                reader.note("Arcee", "x", at("2026-10-31T09:00")),
+                Err(MemoryError::Invalid { .. })
+            ),
+            "writes are refused"
+        );
+        assert!(
+            matches!(reader.compaction_job(), Err(MemoryError::Invalid { .. })),
+            "summary jobs are refused"
+        );
+        assert!(
+            !scratch.path.join("TREE").exists(),
+            "reading did not recreate TREE"
+        );
+    }
+
+    #[test]
+    fn mind_without_nudges_keeps_its_revision_across_nudge_changes() {
+        let scratch = Scratch::new();
+        let memory = memory(&scratch, &NOTES);
+        let now = at("2026-10-31T03:00");
+        let job = memory
+            .dream_job(Trigger::Nightly, None, now)
+            .expect("job")
+            .expect("five new notes");
+        memory
+            .apply_dream(&job.id, reply(&draft("eggs", "Suggest an omelette")), now)
+            .expect("applied");
+        let first = memory.mind().expect("read").expect("written");
+        let shared = first.without_nudges();
+        assert!(
+            !shared.text.contains("## Nudges") && !shared.text.contains("omelette"),
+            "no nudges: {}",
+            shared.text
+        );
+        assert!(shared.text.contains("Lives in Delhi"), "the rest stays");
+        let written =
+            std::fs::read_to_string(scratch.path.join(crate::mind::FILE)).expect("MIND.md");
+        let changed = written.replace("Suggest an omelette", "Suggest a frittata");
+        std::fs::write(scratch.path.join(crate::mind::FILE), changed).expect("rewrite");
+        let second = memory.mind().expect("read").expect("written");
+        assert_ne!(first.revision, second.revision, "the whole file changed");
+        assert_eq!(
+            shared.revision,
+            second.without_nudges().revision,
+            "a nudge-only change keeps the shared revision"
+        );
     }
 
     const NOTES: [(&str, &str, &str); 5] = [

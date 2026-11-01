@@ -40,7 +40,10 @@ come as job/apply pairs: the library hands over a prompt, the harness asks
 its own model, and the library checks the answer before anything is
 written. Calls take the current time as an argument and never call a
 model. Notes start with `[by <agent>]`, so several agents can share one
-notebook.
+notebook. `Memory::create_with_note` makes a notebook only once its first
+note is valid, `Memory::open_read_only` reads one without creating or
+writing anything, and `MindView::without_nudges` gives MIND.md to agents
+that do not act on nudges.
 
 ## Build
 

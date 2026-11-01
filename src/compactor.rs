@@ -14,12 +14,11 @@
 //! OptMem does, until a later run succeeds.
 
 use std::fs;
-use std::fs::OpenOptions;
-use std::fs::TryLockError;
 use std::io;
 use std::path::Path;
 
 use crate::files;
+use crate::files::Lock;
 use crate::model::Answer;
 use crate::model::Job;
 use crate::model::Model;
@@ -89,28 +88,16 @@ pub enum Run {
 /// is already doing so.
 pub fn run(notebook: &Notebook, model: &mut dyn Model) -> Result<Run, NotebookError> {
     let path = notebook.dir().join(".compact.lock");
-    let io_error = |source| NotebookError::Io {
-        path: path.clone(),
-        source,
-    };
-    let lock = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&path)
-        .map_err(io_error)?;
     let mut report = Report::default();
     let mut first = true;
     loop {
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) if first => return Ok(Run::Busy),
-            Err(TryLockError::WouldBlock) => return Ok(Run::Ran(report)),
-            Err(TryLockError::Error(source)) => return Err(io_error(source)),
-        }
+        let Some(lock) = Lock::try_take(&path)? else {
+            return Ok(if first { Run::Busy } else { Run::Ran(report) });
+        };
         first = false;
         let wrote = write_due(notebook, model, &mut report)
             .and_then(|()| record(notebook.dir(), report.stopped.as_ref()));
-        lock.unlock().map_err(io_error)?;
+        drop(lock);
         wrote?;
         if report.stopped.is_some() || notebook.pending_count(notebook.len()?)? == 0 {
             return Ok(Run::Ran(report));

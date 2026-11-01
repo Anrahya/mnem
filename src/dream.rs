@@ -18,7 +18,6 @@ use std::collections::HashSet;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::fs::TryLockError;
 use std::io;
 use std::io::Read;
 use std::io::Seek;
@@ -31,6 +30,7 @@ use jiff::civil::DateTime;
 
 use crate::cover;
 use crate::files;
+use crate::files::Lock;
 use crate::fired;
 use crate::fired::Fired;
 use crate::mind;
@@ -153,21 +153,11 @@ pub fn run(
     trigger: Trigger,
     now: DateTime,
 ) -> Result<Outcome, NotebookError> {
-    let dir = notebook.dir();
-    let lock_path = dir.join(LOCK);
-    let lock = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&lock_path)
-        .map_err(|source| io_error(&lock_path, source))?;
-    match lock.try_lock() {
-        Ok(()) => {}
+    let Some(lock) = Lock::try_take(&notebook.dir().join(LOCK))? else {
         // A dream is running; it, or the next one, reads these notes.
-        Err(TryLockError::WouldBlock) => return Ok(Outcome::Busy),
-        Err(TryLockError::Error(source)) => return Err(io_error(&lock_path, source)),
-    }
+        return Ok(Outcome::Busy);
+    };
     let outcome = dream_locked(notebook, model, trigger, now);
-    // Closing the file releases the lock.
     drop(lock);
     outcome
 }
@@ -306,20 +296,9 @@ pub fn apply(
     apply_locked(notebook, id, answer, now)
 }
 
-/// Takes Dream's lock unless another dream holds it; dropping the file
-/// releases it.
-fn try_hold(dir: &Path) -> Result<Option<File>, NotebookError> {
-    let path = dir.join(LOCK);
-    let lock = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(&path)
-        .map_err(|source| io_error(&path, source))?;
-    match lock.try_lock() {
-        Ok(()) => Ok(Some(lock)),
-        Err(TryLockError::WouldBlock) => Ok(None),
-        Err(TryLockError::Error(source)) => Err(io_error(&path, source)),
-    }
+/// Takes Dream's lock unless another dream holds it.
+fn try_hold(dir: &Path) -> Result<Option<Lock>, NotebookError> {
+    Lock::try_take(&dir.join(LOCK))
 }
 
 fn header(now: DateTime, trigger: Trigger) -> String {
