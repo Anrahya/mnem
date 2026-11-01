@@ -31,6 +31,7 @@ use regex::RegexBuilder;
 use crate::compactor;
 use crate::compactor::SummaryId;
 use crate::compactor::SummaryJob;
+use crate::config::Config;
 use crate::cover;
 use crate::day::Day;
 use crate::dream;
@@ -51,6 +52,7 @@ use crate::record::Note;
 use crate::simhash;
 use crate::span::Span;
 use crate::tags;
+use crate::text;
 use crate::text::TEXT_MAX;
 use crate::text::Text;
 use crate::text::TextError;
@@ -204,7 +206,10 @@ impl Memory {
         now: DateTime,
     ) -> Result<(Self, NoteOutcome), MemoryError> {
         if !Notebook::exists(dir) {
-            checked_note(author, text, ENTRY_CHARS, 0, now)?;
+            // A `config` placed before the first note sets the limit.
+            let config =
+                Config::read(dir).map_err(|error| opening(dir, NotebookError::Config(error)))?;
+            checked_note(author, text, config.entry_chars(), 0, now)?;
         }
         let memory = Self::create(dir)?;
         let outcome = memory.note(author, text, now)?;
@@ -521,7 +526,7 @@ fn checked_note(
     now: DateTime,
 ) -> Result<(Text, tags::Tags, Day), MemoryError> {
     let author = checked_author(author)?;
-    if text.trim().is_empty() {
+    if text.trim_matches(text::is_python_space).is_empty() {
         return Err(invalid(note_problem(&TextError::Empty, limit)));
     }
     let full = format!("[by {author}] {text}");
@@ -1039,7 +1044,7 @@ mod tests {
     fn a_blank_note_is_refused() {
         let scratch = Scratch::new();
         let memory = memory(&scratch, &[]);
-        for text in ["", "   "] {
+        for text in ["", "   ", "\u{1c}\u{1f}"] {
             assert!(
                 matches!(
                     memory.note("Arcee", text, at("2026-10-31T09:00")),
@@ -1079,6 +1084,21 @@ mod tests {
             Memory::create_with_note(&dir, "Scout", "Likes tea", at("2026-10-31T09:05"))
                 .expect("an existing notebook takes the note");
         assert_eq!(again.id, 1, "appended, not recreated");
+
+        let seeded = scratch.path.join("seeded");
+        std::fs::create_dir_all(&seeded).expect("dir");
+        std::fs::write(seeded.join("config"), "ENTRY_CHARS=20\n").expect("config");
+        assert!(
+            matches!(
+                Memory::create_with_note(&seeded, "Arcee", &"x".repeat(30), at("2026-10-31T09:00")),
+                Err(MemoryError::Invalid { .. })
+            ),
+            "a seeded config's limit applies to the first note"
+        );
+        assert!(
+            !crate::notebook::Notebook::exists(&seeded) && !seeded.join("TREE").exists(),
+            "the refused note created no notebook in the seeded dir"
+        );
     }
 
     #[test]
