@@ -1,7 +1,7 @@
 # Mnem
 
 Memory for proactive agents, in Rust. The design is the spec at
-https://claude.ai/artifact/5VHSbkX5WpDaiS3PHd2xJT (draft 5). Read the part
+https://claude.ai/artifact/5VHSbkX5WpDaiS3PHd2xJT (draft 6). Read the part
 you are building before writing code; when code and spec disagree, raise it
 instead of silently picking one.
 
@@ -68,4 +68,6 @@ On top of that skill, these rules come from Google's Rust style guide:
   3 to decline), and Mnem has no model of its own or any provider's API. They happen only in the compactor and Dream, and code
   validates everything they return before it touches disk. A harness that
   embeds Mnem as a library (`src/memory.rs`) gets the same work as job/apply
-  pairs instead and calls its own model; the library never calls one.
+  pairs instead and calls its own model; the library never calls one. The
+  note pass (`src/pass.rs`) is library-only: Mnem writes its prompt and
+  decides when it is due, and the harness runs it as its own agent's turn.

@@ -615,7 +615,7 @@ fn facts(notebook: &Notebook, end: u64) -> Result<Facts, NotebookError> {
 /// Notebook material as it goes into the prompt, with angle brackets
 /// swapped for look-alikes so it cannot close or open the prompt's
 /// sections.
-fn data(text: &str) -> String {
+pub(crate) fn data(text: &str) -> String {
     text.replace('<', "‹").replace('>', "›")
 }
 
@@ -836,7 +836,7 @@ fn prompt(
 }
 
 /// The first `max` bytes of `text`, ending at a character boundary.
-fn capped(text: &str, max: usize) -> &str {
+pub(crate) fn capped(text: &str, max: usize) -> &str {
     let mut end = max.min(text.len());
     while !text.is_char_boundary(end) {
         end = end.saturating_sub(1);

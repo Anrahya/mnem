@@ -45,6 +45,15 @@ note is valid, `Memory::open_read_only` reads one without creating or
 writing anything, and `MindView::without_nudges` gives MIND.md to agents
 that do not act on nudges.
 
+The library also offers a backup note-taker, the note pass. Once a
+conversation has gone quiet, `mnem::pass::due` decides from the harness's
+counts whether a pass runs: after 15 minutes of silence, 2 hours after the
+last pass, and at most 5 a day, the last kept for a sweep before the nightly
+dream. `Memory::note_pass` writes the message the harness appends to the
+conversation: the pass's instructions, the notes already written since the
+range began, and the harness's automations as data. The agent answers with
+ordinary notes, and the harness runs it as a turn of its own.
+
 ## Build
 
 Requires Rust 1.98 or newer.
