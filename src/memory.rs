@@ -391,6 +391,14 @@ impl Memory {
                 input.since_note
             )));
         }
+        let today = pass::day(input.now);
+        if input.day != today && Some(input.day) != today.yesterday().ok() {
+            return Err(invalid(format!(
+                "the pass counts against {}, but at {} only {today} or the day before can",
+                input.day,
+                fired::minutes(input.now)
+            )));
+        }
         let max = u64::try_from(pass::NOTED_MAX).unwrap_or(u64::MAX);
         let first = input.since_note.max(notes.saturating_sub(max));
         let mut index = TagIndex::default();
@@ -1475,12 +1483,14 @@ mod tests {
     }
 
     fn input<'a>(since_note: u64, armed: &'a [Scheduled], ended: &'a [Scheduled]) -> PassInput<'a> {
+        let now = at("2026-11-02T12:00");
         PassInput {
             since: None,
             since_note,
             armed,
             ended,
-            now: at("2026-11-02T12:00"),
+            day: pass::day(now),
+            now,
             tools: TOOLS,
         }
     }
@@ -1562,6 +1572,40 @@ mod tests {
                 .ends_with("reply NONE or the ids of the notes you wrote."),
             "the pass's own instruction comes last: {message}"
         );
+    }
+
+    #[test]
+    fn the_sweep_dates_the_day_that_is_ending() {
+        let scratch = Scratch::new();
+        let memory = facts(&scratch, 1);
+        let ended = [scheduled("yesterday", Some("2026-11-02T20:00"))];
+        let message = memory
+            .note_pass(&PassInput {
+                now: at("2026-11-03T11:00"),
+                day: pass::day(at("2026-11-03T10:59")),
+                ..input(0, &[], &ended)
+            })
+            .expect("a pass message");
+        assert!(
+            message.contains("Finished or deleted since 2026-11-02T11:00:\n- yesterday"),
+            "the sweep at the day start lists the day that is ending: {message}"
+        );
+    }
+
+    #[test]
+    fn a_note_pass_refuses_a_day_it_cannot_count_against() {
+        let scratch = Scratch::new();
+        let memory = facts(&scratch, 1);
+        for day in [at("2026-11-03T12:00"), at("2026-10-31T12:00")] {
+            let refused = memory.note_pass(&PassInput {
+                day: day.date(),
+                ..input(0, &[], &[])
+            });
+            assert!(
+                matches!(refused, Err(MemoryError::Invalid { .. })),
+                "at 2026-11-02T12:00 only 11-02 or 11-01 can be the pass day, not {day}"
+            );
+        }
     }
 
     #[test]
