@@ -8,7 +8,9 @@
 //!
 //! [`due`] decides when, from counts the harness keeps. A pass day runs from
 //! one [`DAY_START_HOUR`] to the next, so the sweep run just before the
-//! nightly dream is the last pass of its day.
+//! nightly dream is the last pass of its day. The sweep runs at or after
+//! that hour, when [`day`]`(now)` is already the next day, so the harness
+//! counts it, and dates its message, against the day that is ending.
 
 use jiff::Span;
 use jiff::civil::Date;
@@ -97,8 +99,9 @@ pub struct PassStats {
     pub last_activity: DateTime,
     /// When this person's last pass finished, in any conversation.
     pub last_pass: Option<DateTime>,
-    /// How many passes finished for this person in [`day`]`(now)`; a
-    /// cancelled pass does not count.
+    /// How many passes finished for this person in the pass day this pass
+    /// counts against, the same day as [`PassInput::day`]; a cancelled pass
+    /// does not count.
     pub passes_today: u32,
     /// How many characters (`str::chars`) the user wrote in this
     /// conversation since its last pass.
@@ -165,8 +168,8 @@ pub struct PassInput<'a> {
     /// Automations that finished or were deleted in the pass day `day`.
     pub ended: &'a [Scheduled],
     /// The pass day this pass counts against: [`day`]`(now)` for a daytime
-    /// pass, and for the sweep, which runs at [`DAY_START_HOUR`], the day
-    /// that is ending.
+    /// pass, and for the sweep, which runs at or after [`DAY_START_HOUR`],
+    /// the day before [`day`]`(now)`. Any other day is refused.
     pub day: Date,
     /// The current time, in the notebook's zone.
     pub now: DateTime,
@@ -219,8 +222,8 @@ fn out_of_range() -> PassDecision {
 }
 
 /// The pass day `now` falls in: the calendar day, or the one before it
-/// until [`DAY_START_HOUR`]. At that hour it is already the new day, so the
-/// sweep counts against the day before this one.
+/// until [`DAY_START_HOUR`]. From that hour on it is already the new day, so
+/// the sweep counts against the day before `day(now)`.
 pub fn day(now: DateTime) -> Date {
     let date = now.date();
     if now.hour() >= DAY_START_HOUR {
