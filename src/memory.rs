@@ -190,6 +190,16 @@ pub struct AgendaView {
     pub problems: Vec<String>,
 }
 
+/// What [`Memory::nudge_run`] hands the harness for one run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NudgeRun {
+    /// The message to run as the agent's turn.
+    pub message: String,
+    /// Whether to show the agent's reply to the user. A quiet item is
+    /// prepared without telling them, and its message says so.
+    pub notify: bool,
+}
+
 /// A marker for what [`Memory::agenda`] reads: the notes, MIND.md and the
 /// fired ledger. While it stays the same, so does the agenda, except that
 /// items go stale as time passes; [`Memory::nudge_run`] leaves those out.
@@ -561,24 +571,25 @@ impl Memory {
         })
     }
 
-    /// The message a one-time run of the timed item `input.id`, due at
+    /// What a one-time run of the timed item `input.id`, due at
     /// `input.due`, sends to the agent, or `None` when the item is no longer
     /// to fire at `input.now`: it fired, went stale, or a later dream or
-    /// note dropped it or moved it to another time. A run before its due
-    /// time still gets the message. Call [`Memory::record_fired`] once the
-    /// run is kept, so it does not come again.
-    pub fn nudge_run(&self, input: &NudgeInput<'_>) -> Result<Option<String>, MemoryError> {
+    /// note dropped it or moved it to another time. A run a little before
+    /// its due time still gets the message.
+    ///
+    /// Call [`Memory::record_fired`] once the run is kept, so it does not
+    /// come again. Until then a second run of the same item gets the
+    /// message too, so run one item at a time.
+    pub fn nudge_run(&self, input: &NudgeInput<'_>) -> Result<Option<NudgeRun>, MemoryError> {
         checked_item_id(input.id)?;
         let agenda = Agenda::read(&self.notebook)?;
         let Some(item) = agenda.live_timed(input.id, minute(input.due), input.now) else {
             return Ok(None);
         };
-        Ok(Some(agenda.run_message(
-            &self.notebook,
-            item,
-            input.now,
-            input.note_tool,
-        )?))
+        Ok(Some(NudgeRun {
+            message: agenda.run_message(&self.notebook, item, input.note_tool)?,
+            notify: item.notify,
+        }))
     }
 
     /// Records that the item `id`, due at `due` if it is timed, was handed to
@@ -1512,14 +1523,17 @@ mod tests {
             &scratch,
             &[("2026-11-02T09:00", "main", "Call mum [at 2026-11-02T14:00]")],
         );
-        let message = memory
+        let reminder = memory
             .nudge_run(&run("r0", "2026-11-02T14:00", "2026-11-02T14:00"))
             .expect("read")
             .expect("the reminder is due");
+        assert!(reminder.notify, "a reminder is for the user");
+        let message = reminder.message;
         assert!(
-            message.starts_with("Reminder run at 2026-11-02T14:00")
-                && message.contains(crate::heartbeat::CAUTION),
-            "it opens with the time and the caution: {message}"
+            message.starts_with(
+                "A timed item is due at 2026-11-02T14:00. Handle it now; your reply is shown to the user."
+            ) && message.contains(crate::heartbeat::CAUTION),
+            "it opens with the due time and the caution: {message}"
         );
         assert!(
             message.contains("Reminder in your notes: #0 2026-11-02 [by main] Call mum")
@@ -1529,6 +1543,29 @@ mod tests {
         assert!(
             message.trim_end().ends_with("note it with memory_note."),
             "it closes with the harness's note tool: {message}"
+        );
+        let with_seconds = NudgeInput {
+            due: "2026-11-02T14:00:30".parse().expect("a time with seconds"),
+            ..run("r0", "2026-11-02T14:00", "2026-11-02T14:00")
+        };
+        assert!(
+            memory.nudge_run(&with_seconds).expect("read").is_some(),
+            "the due time counts to the minute"
+        );
+        assert!(
+            memory
+                .nudge_run(&run("r0", "2026-11-02T14:00", "2026-11-02T13:59"))
+                .expect("read")
+                .is_some(),
+            "a run a little early still gets the message"
+        );
+        std::fs::write(scratch.path.join(crate::mind::FILE), "not a mind").expect("written");
+        assert!(
+            memory
+                .nudge_run(&run("r0", "2026-11-02T14:00", "2026-11-02T14:00"))
+                .expect("read")
+                .is_some(),
+            "a MIND.md that does not parse leaves the notes' reminders"
         );
         for (input, why) in [
             (
@@ -1553,6 +1590,15 @@ mod tests {
         memory
             .record_fired("r0", Some(at("2026-11-02T14:00")), at("2026-11-02T14:01"))
             .expect("recorded");
+        let stamp = memory.agenda_stamp().expect("stamp");
+        memory
+            .record_fired("r0", Some(at("2026-11-02T14:00")), at("2026-11-02T14:03"))
+            .expect("a retry is harmless");
+        assert_eq!(
+            memory.agenda_stamp().expect("stamp"),
+            stamp,
+            "a retried record changes nothing"
+        );
         assert_eq!(
             memory
                 .nudge_run(&run("r0", "2026-11-02T14:00", "2026-11-02T14:05"))
@@ -1584,7 +1630,8 @@ mod tests {
         let message = memory
             .nudge_run(&run("eggs", "2026-10-31T08:00", "2026-10-31T08:00"))
             .expect("read")
-            .expect("the nudge is due");
+            .expect("the nudge is due")
+            .message;
         assert!(
             message.contains("1. Suggest an omelette (tell the user)")
                 && message.contains("#4 2026-10-30 [by Arcee] Bought eggs and spinach"),
@@ -1596,6 +1643,74 @@ mod tests {
                 .expect("read"),
             None,
             "past its until, the nudge is stale"
+        );
+    }
+
+    #[test]
+    fn a_corrected_reminder_runs_with_its_correction() {
+        let scratch = Scratch::new();
+        let memory = memory(
+            &scratch,
+            &[
+                ("2026-11-02T09:00", "main", "Dentist [at 2026-11-03T10:00]"),
+                ("2026-11-02T10:00", "main", "[updates #0] Dentist cancelled"),
+            ],
+        );
+        let message = memory
+            .nudge_run(&run("r0", "2026-11-03T10:00", "2026-11-03T10:00"))
+            .expect("read")
+            .expect("a correction without its own reminder leaves it")
+            .message;
+        assert!(
+            message.contains(
+                "A later note corrects this one; check it before you act:\n#1 2026-11-02 [by main] [updates #0] Dentist cancelled"
+            ),
+            "the correction is shown: {message}"
+        );
+        memory
+            .record_fired("r0", Some(at("2026-11-03T10:00")), at("2026-11-03T10:00"))
+            .expect("recorded");
+        memory
+            .note(
+                "main",
+                "[updates #1] Dentist back on [at 2026-11-03T10:00]",
+                at("2026-11-03T10:05"),
+            )
+            .expect("saved");
+        assert_eq!(
+            memory
+                .nudge_run(&run("r2", "2026-11-03T10:00", "2026-11-03T10:06"))
+                .expect("read"),
+            None,
+            "the reminder it replaces already fired for that time"
+        );
+    }
+
+    #[test]
+    fn a_quiet_nudge_runs_without_the_user() {
+        let scratch = Scratch::new();
+        let memory = memory(&scratch, &NOTES);
+        let now = at("2026-10-31T03:00");
+        let job = memory
+            .dream_job(Trigger::Nightly, None, now)
+            .expect("job")
+            .expect("due");
+        let text = draft("eggs", "Plan an omelette").replace("| notify", "| quiet");
+        memory
+            .apply_dream(&job.id, reply(&text), now)
+            .expect("applied");
+        let quiet = memory
+            .nudge_run(&run("eggs", "2026-10-31T08:00", "2026-10-31T08:00"))
+            .expect("read")
+            .expect("the nudge is due");
+        assert!(!quiet.notify, "the harness keeps the reply from the user");
+        assert!(
+            quiet
+                .message
+                .starts_with("A quiet item is due at 2026-10-31T08:00.")
+                && !quiet.message.contains("what the user says"),
+            "the agent is told its reply is not shown: {}",
+            quiet.message
         );
     }
 
