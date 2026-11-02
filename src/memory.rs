@@ -1553,7 +1553,7 @@ mod tests {
             "armed automations come soonest first, undated last"
         );
         assert!(
-            message.contains("Finished or deleted since 11:00:\n(none)"),
+            message.contains("Finished or deleted since 2026-11-02T11:00:\n(none)"),
             "an empty section says so: {message}"
         );
         assert!(
@@ -1569,10 +1569,10 @@ mod tests {
         let scratch = Scratch::new();
         let memory = facts(&scratch, pass::NOTED_MAX + 2);
         let mut ended = Vec::new();
-        for hour in 0..pass::ENDED_MAX {
+        for minute in 0..pass::ENDED_MAX {
             ended.push(scheduled(
-                &format!("ended{hour:02}"),
-                Some(&format!("2026-11-02T{hour:02}:00")),
+                &format!("ended{minute:02}"),
+                Some(&format!("2026-11-02T11:{minute:02}")),
             ));
         }
         ended.push(scheduled("undated-end", None));
