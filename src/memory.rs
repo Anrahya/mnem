@@ -1553,7 +1553,7 @@ mod tests {
             "armed automations come soonest first, undated last"
         );
         assert!(
-            message.contains("Finished or deleted since 04:00:\n(none)"),
+            message.contains("Finished or deleted since 11:00:\n(none)"),
             "an empty section says so: {message}"
         );
         assert!(
