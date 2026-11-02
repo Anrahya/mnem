@@ -11,7 +11,7 @@ context and the session entry points work and are tested; no harness is wired
 to them yet.
 
 Design: [Mnem: A Memory System for Proactive Agents](https://claude.ai/artifact/5VHSbkX5WpDaiS3PHd2xJT)
-(draft 5).
+(draft 6).
 
 ## Wiring it to a harness
 
@@ -44,6 +44,15 @@ notebook. `Memory::create_with_note` makes a notebook only once its first
 note is valid, `Memory::open_read_only` reads one without creating or
 writing anything, and `MindView::without_nudges` gives MIND.md to agents
 that do not act on nudges.
+
+The library also offers a backup note-taker, the note pass. Once a
+conversation has gone quiet, `mnem::pass::due` decides from the harness's
+counts whether a pass runs: after 15 minutes of silence, 2 hours after the
+last pass, and at most 5 a day, the last kept for a sweep before the nightly
+dream. `Memory::note_pass` writes the message the harness appends to the
+conversation: the pass's instructions, the notes already written since the
+range began, and the harness's automations as data. The agent answers with
+ordinary notes, and the harness runs it as a turn of its own.
 
 ## Build
 

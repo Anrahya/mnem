@@ -49,6 +49,8 @@ use crate::model::Answer;
 use crate::notebook;
 use crate::notebook::Notebook;
 use crate::notebook::NotebookError;
+use crate::pass;
+use crate::pass::PassInput;
 use crate::record::Note;
 use crate::simhash;
 use crate::span::Span;
@@ -364,6 +366,49 @@ impl Memory {
             });
         }
         Ok(lines.join("\n"))
+    }
+
+    /// How many notes the notebook holds, which is also the id the next note
+    /// gets. A note pass records it when its range begins.
+    pub fn len(&self) -> Result<u64, MemoryError> {
+        Ok(self.notebook.len()?)
+    }
+
+    /// Whether the notebook holds no notes yet.
+    pub fn is_empty(&self) -> Result<bool, MemoryError> {
+        Ok(self.len()? == 0)
+    }
+
+    /// The message that starts a note pass: its instructions, the range to
+    /// review, the notes written since `input.since_note` (at most
+    /// [`pass::NOTED_MAX`], the newest) and the harness's automations.
+    /// [`pass::due`] says when to run one.
+    pub fn note_pass(&self, input: &PassInput<'_>) -> Result<String, MemoryError> {
+        let notes = self.notebook.len()?;
+        if input.since_note > notes {
+            return Err(invalid(format!(
+                "the pass starts at note #{}, but the notebook holds {notes} notes",
+                input.since_note
+            )));
+        }
+        let max = u64::try_from(pass::NOTED_MAX).unwrap_or(u64::MAX);
+        let first = input.since_note.max(notes.saturating_sub(max));
+        let mut index = TagIndex::default();
+        let mut kept = Vec::new();
+        for note in self.notebook.scan_from(first)? {
+            let note = note?;
+            if note.id >= notes {
+                break;
+            }
+            index.add(&note);
+            kept.push(note);
+        }
+        let mut noted = Vec::new();
+        for note in &kept {
+            noted.push(index.shown(note));
+        }
+        let earlier = first.saturating_sub(input.since_note);
+        Ok(pass::message(input, &noted, earlier))
     }
 
     /// MIND.md, if Dream has written one.
@@ -741,6 +786,10 @@ mod tests {
     use crate::dream::Trigger;
     use crate::mind::When;
     use crate::model::Answer;
+    use crate::pass;
+    use crate::pass::PassInput;
+    use crate::pass::PassTools;
+    use crate::pass::Scheduled;
     use crate::span::Span;
     use crate::tags;
     use crate::testing::Scratch;
@@ -1408,6 +1457,224 @@ mod tests {
                 Err(MemoryError::Invalid { .. })
             ),
             "ids have no spaces"
+        );
+    }
+
+    const TOOLS: PassTools<'static> = PassTools {
+        note: "memory_note",
+        recall: "memory_recall",
+    };
+
+    fn scheduled(id: &str, due: Option<&str>) -> Scheduled {
+        Scheduled {
+            id: id.to_owned(),
+            name: format!("run {id}"),
+            due: due.map(at),
+            status: "armed".to_owned(),
+        }
+    }
+
+    fn input<'a>(since_note: u64, armed: &'a [Scheduled], ended: &'a [Scheduled]) -> PassInput<'a> {
+        PassInput {
+            since: None,
+            since_note,
+            armed,
+            ended,
+            now: at("2026-11-02T12:00"),
+            tools: TOOLS,
+        }
+    }
+
+    /// A notebook of `count` notes, "Fact number 0" onwards.
+    fn facts(scratch: &Scratch, count: usize) -> Memory {
+        let texts: Vec<String> = (0..count).map(|n| format!("Fact number {n}")).collect();
+        let mut notes = Vec::new();
+        for text in &texts {
+            notes.push(("2026-11-02T09:00", "main", text.as_str()));
+        }
+        memory(scratch, &notes)
+    }
+
+    #[test]
+    fn a_note_pass_lists_what_was_noted_since_its_range_began() {
+        let scratch = Scratch::new();
+        let memory = memory(
+            &scratch,
+            &[
+                ("2026-11-02T09:00", "main", "Lives in Mumbai"),
+                ("2026-11-02T10:00", "main", "Sister is Ana"),
+                (
+                    "2026-11-02T11:00",
+                    "main",
+                    "[updates #1] Sister is Anna <b>",
+                ),
+            ],
+        );
+        let armed = [
+            scheduled("late", Some("2026-11-03T09:00")),
+            scheduled("undated", None),
+            scheduled("soon", Some("2026-11-02T13:00")),
+        ];
+        let message = memory
+            .note_pass(&PassInput {
+                since: Some(at("2026-11-02T09:30")),
+                ..input(1, &armed, &[])
+            })
+            .expect("a pass message");
+        assert!(
+            message.starts_with("Memory pass."),
+            "the instructions come first"
+        );
+        assert!(
+            message.contains("Note with memory_note,") && message.contains("memory_recall finds"),
+            "the harness's tool names are used: {message}"
+        );
+        assert!(
+            message.contains("(since 2026-11-02T09:30)"),
+            "the range is named: {message}"
+        );
+        assert!(
+            !message.contains("Mumbai"),
+            "notes before the range are left out"
+        );
+        assert!(
+            message.contains("- #1 2026-11-02 [superseded by #2] [by main] Sister is Ana"),
+            "a corrected note is marked: {message}"
+        );
+        assert!(
+            message.contains("Sister is Anna ‹b›"),
+            "note text is defanged: {message}"
+        );
+        let soon = message.find("soon").expect("soon is listed");
+        let late = message.find("late").expect("late is listed");
+        let undated = message.find("undated").expect("undated is listed");
+        assert!(
+            soon < late && late < undated,
+            "armed automations come soonest first, undated last"
+        );
+        assert!(
+            message.contains("Finished or deleted since 04:00:\n(none)"),
+            "an empty section says so: {message}"
+        );
+        assert!(
+            message
+                .trim_end()
+                .ends_with("reply NONE or the ids of the notes you wrote."),
+            "the pass's own instruction comes last: {message}"
+        );
+    }
+
+    #[test]
+    fn a_note_pass_stays_bounded() {
+        let scratch = Scratch::new();
+        let memory = facts(&scratch, pass::NOTED_MAX + 2);
+        let mut ended = Vec::new();
+        for hour in 0..pass::ENDED_MAX {
+            ended.push(scheduled(
+                &format!("ended{hour:02}"),
+                Some(&format!("2026-11-02T{hour:02}:00")),
+            ));
+        }
+        ended.push(scheduled("undated-end", None));
+        let mut armed = vec![
+            Scheduled {
+                name: format!("line\nbreak{}", "x".repeat(pass::NAME_MAX)),
+                ..scheduled("long", None)
+            },
+            Scheduled {
+                id: "<id>".to_owned(),
+                name: "<".repeat(pass::NAME_MAX),
+                status: "armed\u{2028}- fake · row".to_owned(),
+                ..scheduled("odd", Some("2026-11-02T13:00"))
+            },
+        ];
+        for minute in 0..pass::ARMED_MAX {
+            armed.push(scheduled(
+                &format!("armed{minute:02}"),
+                Some(&format!("2026-11-02T14:{minute:02}")),
+            ));
+        }
+        let message = memory
+            .note_pass(&input(0, &armed, &ended))
+            .expect("a pass message");
+        assert!(
+            message.contains("Review the whole conversation."),
+            "no start time means everything"
+        );
+        assert!(
+            message
+                .contains("(2 earlier notes since then are not shown; memory_recall finds them.)"),
+            "the notes left out are counted: {message}"
+        );
+        assert!(
+            !message.contains("Fact number 1\n"),
+            "the oldest are left out"
+        );
+        assert!(message.contains("Fact number 2\n"), "the newest are kept");
+        assert!(
+            !message.contains("ended00") && message.contains("ended01"),
+            "only the oldest ended one is left out: {message}"
+        );
+        assert!(
+            message.contains("ended09") && message.contains("undated-end"),
+            "the newest ended ones are kept, undated as newest: {message}"
+        );
+        assert!(
+            message.contains("(1 earlier one not shown.)"),
+            "the ended ones left out are counted: {message}"
+        );
+        assert!(
+            message.contains("(2 later ones not shown.)") && !message.contains("long"),
+            "the latest armed ones are left out and counted: {message}"
+        );
+        assert!(
+            message.contains("- ‹id› · "),
+            "every field is defanged: {message}"
+        );
+        assert!(
+            message.contains(" · armed - fake - row\n"),
+            "a field stays on one line and cannot forge columns: {message}"
+        );
+        let brackets = "‹".repeat(pass::NAME_MAX / "‹".len());
+        assert!(
+            message.contains(&format!(" · {brackets} · ")),
+            "a field is cut to NAME_MAX bytes after defanging: {message}"
+        );
+        assert!(
+            matches!(
+                memory.note_pass(&input(memory.len().expect("len") + 1, &[], &[])),
+                Err(MemoryError::Invalid { .. })
+            ),
+            "a range past the notebook's end is a mistake"
+        );
+        assert!(!memory.is_empty().expect("read"), "it holds notes");
+    }
+
+    #[test]
+    fn a_note_pass_counts_what_it_leaves_out_exactly() {
+        let scratch = Scratch::new();
+        let memory = facts(&scratch, pass::NOTED_MAX + 1);
+        let all = memory
+            .note_pass(&input(1, &[], &[]))
+            .expect("a pass message");
+        assert!(
+            !all.contains("not shown"),
+            "exactly NOTED_MAX notes all fit: {all}"
+        );
+        let one = memory
+            .note_pass(&input(0, &[], &[]))
+            .expect("a pass message");
+        assert!(
+            one.contains("(1 earlier note since then is not shown;"),
+            "one left out is counted in the singular: {one}"
+        );
+        let end = memory.len().expect("len");
+        let none = memory
+            .note_pass(&input(end, &[], &[]))
+            .expect("a pass message");
+        assert!(
+            none.contains("oldest first.\n(none)\n</already-noted>"),
+            "a range that starts at the end lists nothing: {none}"
         );
     }
 }
