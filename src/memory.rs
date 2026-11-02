@@ -1475,12 +1475,14 @@ mod tests {
     }
 
     fn input<'a>(since_note: u64, armed: &'a [Scheduled], ended: &'a [Scheduled]) -> PassInput<'a> {
+        let now = at("2026-11-02T12:00");
         PassInput {
             since: None,
             since_note,
             armed,
             ended,
-            now: at("2026-11-02T12:00"),
+            day: pass::day(now),
+            now,
             tools: TOOLS,
         }
     }
@@ -1561,6 +1563,24 @@ mod tests {
                 .trim_end()
                 .ends_with("reply NONE or the ids of the notes you wrote."),
             "the pass's own instruction comes last: {message}"
+        );
+    }
+
+    #[test]
+    fn the_sweep_dates_the_day_that_is_ending() {
+        let scratch = Scratch::new();
+        let memory = facts(&scratch, 1);
+        let ended = [scheduled("yesterday", Some("2026-11-02T20:00"))];
+        let message = memory
+            .note_pass(&PassInput {
+                now: at("2026-11-03T11:00"),
+                day: pass::day(at("2026-11-03T10:59")),
+                ..input(0, &[], &ended)
+            })
+            .expect("a pass message");
+        assert!(
+            message.contains("Finished or deleted since 2026-11-02T11:00:\n- yesterday"),
+            "the sweep at the day start lists the day that is ending: {message}"
         );
     }
 

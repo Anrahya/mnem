@@ -162,8 +162,12 @@ pub struct PassInput<'a> {
     pub since_note: u64,
     /// Automations still to run.
     pub armed: &'a [Scheduled],
-    /// Automations that finished or were deleted in [`day`]`(now)`.
+    /// Automations that finished or were deleted in the pass day `day`.
     pub ended: &'a [Scheduled],
+    /// The pass day this pass counts against: [`day`]`(now)` for a daytime
+    /// pass, and for the sweep, which runs at [`DAY_START_HOUR`], the day
+    /// that is ending.
+    pub day: Date,
     /// The current time, in the notebook's zone.
     pub now: DateTime,
     /// The harness's tool names.
@@ -215,7 +219,8 @@ fn out_of_range() -> PassDecision {
 }
 
 /// The pass day `now` falls in: the calendar day, or the one before it
-/// until [`DAY_START_HOUR`].
+/// until [`DAY_START_HOUR`]. At that hour it is already the new day, so the
+/// sweep counts against the day before this one.
 pub fn day(now: DateTime) -> Date {
     let date = now.date();
     if now.hour() >= DAY_START_HOUR {
@@ -224,10 +229,10 @@ pub fn day(now: DateTime) -> Date {
     date.yesterday().unwrap_or(date)
 }
 
-/// When the pass day `now` falls in began.
-fn day_start(now: DateTime) -> Option<DateTime> {
+/// When the pass day `day` began.
+fn day_start(day: Date) -> Option<DateTime> {
     let start = Time::new(DAY_START_HOUR, 0, 0, 0).ok()?;
-    Some(DateTime::from_parts(day(now), start))
+    Some(DateTime::from_parts(day, start))
 }
 
 /// The pass message for `input`: the instructions, the range to review,
@@ -276,7 +281,7 @@ pub(crate) fn message(input: &PassInput<'_>, noted: &[String], earlier: u64) -> 
         noted = listed(&lines),
         armed = listed(&scheduled_lines(&armed, armed_left, "later")),
         start =
-            day_start(input.now).map_or_else(|| format!("{DAY_START_HOUR:02}:00"), fired::minutes),
+            day_start(input.day).map_or_else(|| format!("{DAY_START_HOUR:02}:00"), fired::minutes),
         ended = listed(&scheduled_lines(&ended, ended_left, "earlier")),
     )
 }
@@ -529,10 +534,10 @@ mod tests {
     }
 
     #[test]
-    fn a_pass_after_midnight_dates_the_start_of_its_day() {
+    fn a_pass_day_starts_at_its_hour() {
         let late = date(2026, 11, 3).at(2, 0, 0, 0);
         assert_eq!(
-            super::day_start(late),
+            super::day_start(pass::day(late)),
             Some(at(11, 0)),
             "at 02:00 the pass day began at 11:00 the day before"
         );
