@@ -39,6 +39,19 @@ const CITED_MAX: usize = 5;
 /// the agent's context.
 pub const BRIEF_MAX: usize = 10;
 
+/// What [`crate::memory::Memory::nudge_run`] needs from the harness.
+#[derive(Clone, Copy, Debug)]
+pub struct NudgeInput<'a> {
+    /// The timed item's id, as [`crate::memory::AgendaView::timed`] gave it.
+    pub id: &'a str,
+    /// When it is due, as the agenda gave it.
+    pub due: DateTime,
+    /// The current time, in the notebook's zone.
+    pub now: DateTime,
+    /// The harness's name for the tool that writes a note.
+    pub note_tool: &'a str,
+}
+
 /// What the heartbeat can hand the agent.
 #[derive(Clone, Debug, Default)]
 pub struct Agenda {
@@ -220,6 +233,40 @@ impl Agenda {
             }
         }
         earliest
+    }
+
+    /// The timed item `id` due at `due`, if it is still to fire at `now`:
+    /// still in MIND.md or the notes with that time, not fired and not stale.
+    pub fn live_timed(&self, id: &str, due: DateTime, now: DateTime) -> Option<&Nudge> {
+        self.timed(now)
+            .into_iter()
+            .find(|item| item.id == id && when_key(item) == Some(due))
+    }
+
+    /// The message a one-time run of the timed `item` sends at `now`: the
+    /// caution, the item with the notes it cites, and an instruction to note
+    /// what matters with `note_tool`.
+    pub fn run_message(
+        &self,
+        notebook: &Notebook,
+        item: &Nudge,
+        now: DateTime,
+        note_tool: &str,
+    ) -> Result<String, NotebookError> {
+        let mut out = vec![
+            format!(
+                "Reminder run at {}: one thing is due. Handle it now.",
+                fired::minutes(now)
+            ),
+            CAUTION.to_owned(),
+            String::new(),
+        ];
+        out.extend(self.describe(notebook, &[item])?);
+        out.push(String::new());
+        out.push(format!(
+            "It comes only this once. If what you do about it, or what the user says, is worth remembering, note it with {note_tool}."
+        ));
+        Ok(out.join("\n"))
     }
 
     /// Whether `item` has neither fired nor gone stale.

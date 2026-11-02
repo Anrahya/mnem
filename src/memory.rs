@@ -41,6 +41,7 @@ use crate::dream::Prepared;
 use crate::dream::Trigger;
 use crate::fired;
 use crate::heartbeat::Agenda;
+use crate::heartbeat::NudgeInput;
 use crate::index::TagIndex;
 use crate::mind;
 use crate::mind::Mind;
@@ -187,6 +188,16 @@ pub struct AgendaView {
     pub events: Vec<Nudge>,
     /// What could not be read, such as a MIND.md that does not parse.
     pub problems: Vec<String>,
+}
+
+/// A marker for what [`Memory::agenda`] reads: the notes, MIND.md and the
+/// fired ledger. While it stays the same, so does the agenda, except that
+/// items go stale as time passes; [`Memory::nudge_run`] leaves those out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgendaStamp {
+    notes: u64,
+    mind: String,
+    fired: String,
 }
 
 impl Memory {
@@ -526,9 +537,54 @@ impl Memory {
         })
     }
 
+    /// A marker that changes whenever what [`Memory::agenda`] reads does,
+    /// and costs far less than the agenda: compare it with the last one
+    /// before asking for the agenda again.
+    pub fn agenda_stamp(&self) -> Result<AgendaStamp, MemoryError> {
+        let mind = match dream::read_mind(self.dir()) {
+            Ok(Some(text)) => revision(&text),
+            Ok(None) => String::new(),
+            // The agenda lists no nudges from a file this large, whatever
+            // it holds.
+            Err(error @ NotebookError::TooLarge { .. }) => error.to_string(),
+            Err(error) => return Err(error.into()),
+        };
+        let mut ledger = String::new();
+        for entry in fired::read(self.dir())? {
+            ledger.push_str(&fired::line(&entry));
+            ledger.push('\n');
+        }
+        Ok(AgendaStamp {
+            notes: self.notebook.len()?,
+            mind,
+            fired: revision(&ledger),
+        })
+    }
+
+    /// The message a one-time run of the timed item `input.id`, due at
+    /// `input.due`, sends to the agent, or `None` when the item is no longer
+    /// to fire at `input.now`: it fired, went stale, or a later dream or
+    /// note dropped it or moved it to another time. A run before its due
+    /// time still gets the message. Call [`Memory::record_fired`] once the
+    /// run is kept, so it does not come again.
+    pub fn nudge_run(&self, input: &NudgeInput<'_>) -> Result<Option<String>, MemoryError> {
+        checked_item_id(input.id)?;
+        let agenda = Agenda::read(&self.notebook)?;
+        let Some(item) = agenda.live_timed(input.id, minute(input.due), input.now) else {
+            return Ok(None);
+        };
+        Ok(Some(agenda.run_message(
+            &self.notebook,
+            item,
+            input.now,
+            input.note_tool,
+        )?))
+    }
+
     /// Records that the item `id`, due at `due` if it is timed, was handed to
-    /// the agent at `at`, so it does not fire again. Recording it twice is
-    /// harmless.
+    /// the agent at `at`, so it does not fire again. Times count to the
+    /// minute, so recording the same item and due time again, as a retry
+    /// after a crash does, changes nothing.
     pub fn record_fired(
         &self,
         id: &str,
@@ -536,11 +592,7 @@ impl Memory {
         at: DateTime,
     ) -> Result<(), MemoryError> {
         self.writable()?;
-        if id.is_empty() || id.contains(char::is_whitespace) {
-            return Err(invalid(format!(
-                "{id:?} is not an item id: use the id from the agenda, such as \"call-mom\" or \"r12\"."
-            )));
-        }
+        checked_item_id(id)?;
         // The ledger keeps minutes; compare and record at that precision.
         let due = due.map(minute);
         let at = minute(at);
@@ -589,6 +641,15 @@ fn checked_note(
     let day = Day::try_new(&now.date().to_string())
         .map_err(|_not_a_day| invalid(format!("{now} cannot date a note")))?;
     Ok((text, found, day))
+}
+
+fn checked_item_id(id: &str) -> Result<(), MemoryError> {
+    if id.is_empty() || id.contains(char::is_whitespace) {
+        return Err(invalid(format!(
+            "{id:?} is not an item id: use the id from the agenda, such as \"call-mom\" or \"r12\"."
+        )));
+    }
+    Ok(())
 }
 
 fn revision(text: &str) -> String {
@@ -792,6 +853,7 @@ mod tests {
     use crate::dream;
     use crate::dream::Outcome;
     use crate::dream::Trigger;
+    use crate::heartbeat::NudgeInput;
     use crate::mind::When;
     use crate::model::Answer;
     use crate::pass;
@@ -1431,6 +1493,148 @@ mod tests {
         assert_eq!(
             next, None,
             "three new notes are too few for a nightly dream"
+        );
+    }
+
+    fn run<'a>(id: &'a str, due: &str, now: &str) -> NudgeInput<'a> {
+        NudgeInput {
+            id,
+            due: at(due),
+            now: at(now),
+            note_tool: "memory_note",
+        }
+    }
+
+    #[test]
+    fn a_reminder_run_sends_its_note_once() {
+        let scratch = Scratch::new();
+        let memory = memory(
+            &scratch,
+            &[("2026-11-02T09:00", "main", "Call mum [at 2026-11-02T14:00]")],
+        );
+        let message = memory
+            .nudge_run(&run("r0", "2026-11-02T14:00", "2026-11-02T14:00"))
+            .expect("read")
+            .expect("the reminder is due");
+        assert!(
+            message.starts_with("Reminder run at 2026-11-02T14:00")
+                && message.contains(crate::heartbeat::CAUTION),
+            "it opens with the time and the caution: {message}"
+        );
+        assert!(
+            message.contains("Reminder in your notes: #0 2026-11-02 [by main] Call mum")
+                && message.contains("Id: r0."),
+            "the reminder is described: {message}"
+        );
+        assert!(
+            message.trim_end().ends_with("note it with memory_note."),
+            "it closes with the harness's note tool: {message}"
+        );
+        for (input, why) in [
+            (
+                run("r0", "2026-11-02T15:00", "2026-11-02T15:00"),
+                "another due time",
+            ),
+            (
+                run("r1", "2026-11-02T14:00", "2026-11-02T14:00"),
+                "another id",
+            ),
+            (
+                run("r0", "2026-11-02T14:00", "2026-11-10T14:00"),
+                "a reminder past its grace days",
+            ),
+        ] {
+            assert_eq!(
+                memory.nudge_run(&input).expect("read"),
+                None,
+                "{why} is not live"
+            );
+        }
+        memory
+            .record_fired("r0", Some(at("2026-11-02T14:00")), at("2026-11-02T14:01"))
+            .expect("recorded");
+        assert_eq!(
+            memory
+                .nudge_run(&run("r0", "2026-11-02T14:00", "2026-11-02T14:05"))
+                .expect("read"),
+            None,
+            "a fired reminder does not run again"
+        );
+        assert!(
+            matches!(
+                memory.nudge_run(&run("r 0", "2026-11-02T14:00", "2026-11-02T14:00")),
+                Err(MemoryError::Invalid { .. })
+            ),
+            "ids have no spaces"
+        );
+    }
+
+    #[test]
+    fn a_nudge_run_cites_its_notes_until_it_goes_stale() {
+        let scratch = Scratch::new();
+        let memory = memory(&scratch, &NOTES);
+        let now = at("2026-10-31T03:00");
+        let job = memory
+            .dream_job(Trigger::Nightly, None, now)
+            .expect("job")
+            .expect("due");
+        memory
+            .apply_dream(&job.id, reply(&draft("eggs", "Suggest an omelette")), now)
+            .expect("applied");
+        let message = memory
+            .nudge_run(&run("eggs", "2026-10-31T08:00", "2026-10-31T08:00"))
+            .expect("read")
+            .expect("the nudge is due");
+        assert!(
+            message.contains("1. Suggest an omelette (tell the user)")
+                && message.contains("#4 2026-10-30 [by Arcee] Bought eggs and spinach"),
+            "the nudge and the notes it cites are shown: {message}"
+        );
+        assert_eq!(
+            memory
+                .nudge_run(&run("eggs", "2026-10-31T08:00", "2026-10-31T10:01"))
+                .expect("read"),
+            None,
+            "past its until, the nudge is stale"
+        );
+    }
+
+    #[test]
+    fn the_agenda_stamp_changes_with_what_the_agenda_reads() {
+        let scratch = Scratch::new();
+        let memory = memory(&scratch, &NOTES);
+        let first = memory.agenda_stamp().expect("stamp");
+        assert_eq!(
+            memory.agenda_stamp().expect("stamp"),
+            first,
+            "nothing changed, so neither does the stamp"
+        );
+        memory
+            .note(
+                "main",
+                "Dentist [at 2026-11-04T10:00]",
+                at("2026-11-02T09:00"),
+            )
+            .expect("saved");
+        let noted = memory.agenda_stamp().expect("stamp");
+        assert_ne!(noted, first, "a new note changes it");
+        memory
+            .record_fired("r5", Some(at("2026-11-04T10:00")), at("2026-11-04T10:00"))
+            .expect("recorded");
+        let fired = memory.agenda_stamp().expect("stamp");
+        assert_ne!(fired, noted, "a fired item changes it");
+        let now = at("2026-11-02T09:30");
+        let job = memory
+            .dream_job(Trigger::Nightly, None, now)
+            .expect("job")
+            .expect("six new notes");
+        memory
+            .apply_dream(&job.id, reply(&draft("eggs", "Suggest an omelette")), now)
+            .expect("applied");
+        assert_ne!(
+            memory.agenda_stamp().expect("stamp"),
+            fired,
+            "a new MIND.md changes it"
         );
     }
 
