@@ -39,6 +39,19 @@ const CITED_MAX: usize = 5;
 /// the agent's context.
 pub const BRIEF_MAX: usize = 10;
 
+/// What [`crate::memory::Memory::nudge_run`] needs from the harness.
+#[derive(Clone, Copy, Debug)]
+pub struct NudgeInput<'a> {
+    /// The timed item's id, as [`crate::memory::AgendaView::timed`] gave it.
+    pub id: &'a str,
+    /// When it is due, as the agenda gave it.
+    pub due: DateTime,
+    /// The current time, in the notebook's zone.
+    pub now: DateTime,
+    /// The harness's name for the tool that writes a note.
+    pub note_tool: &'a str,
+}
+
 /// What the heartbeat can hand the agent.
 #[derive(Clone, Debug, Default)]
 pub struct Agenda {
@@ -53,6 +66,8 @@ pub struct Agenda {
     /// For a reminder whose note corrects earlier ones, the ids of their
     /// reminders: if one fired for the same time, this one has too.
     aliases: HashMap<String, Vec<String>>,
+    /// For each reminder, the id of the note that sets it.
+    reminder_notes: HashMap<String, u64>,
     index: TagIndex,
 }
 
@@ -105,6 +120,7 @@ impl Agenda {
             for old in agenda.index.corrects(*id) {
                 older.push(format!("r{old}"));
             }
+            agenda.reminder_notes.insert(format!("r{id}"), *id);
             reminders.push((
                 Nudge {
                     id: format!("r{id}"),
@@ -220,6 +236,59 @@ impl Agenda {
             }
         }
         earliest
+    }
+
+    /// The timed item `id` due at `due`, if it is still to fire at `now`:
+    /// still in MIND.md or the notes with that time, not fired and not stale.
+    pub fn live_timed(&self, id: &str, due: DateTime, now: DateTime) -> Option<&Nudge> {
+        self.timed(now)
+            .into_iter()
+            .find(|item| item.id == id && when_key(item) == Some(due))
+    }
+
+    /// The message a one-time run of the timed `item` sends: the caution,
+    /// the item with the notes it cites, the note that corrects a reminder's
+    /// note, and an instruction to note what matters with `note_tool`. A
+    /// quiet item's message says its reply is not shown to the user.
+    pub fn run_message(
+        &self,
+        notebook: &Notebook,
+        item: &Nudge,
+        note_tool: &str,
+    ) -> Result<String, NotebookError> {
+        let due =
+            when_key(item).map_or_else(String::new, |due| format!(" at {}", fired::minutes(due)));
+        let (opening, closing) = if item.notify {
+            (
+                format!(
+                    "A timed item is due{due}. Handle it now; your reply is shown to the user."
+                ),
+                "If what you do about it, or what the user says, is worth remembering",
+            )
+        } else {
+            (
+                format!(
+                    "A quiet item is due{due}. Prepare it without messaging the user; your reply is not shown to them."
+                ),
+                "If what you do about it is worth remembering",
+            )
+        };
+        let mut out = vec![opening, CAUTION.to_owned(), String::new()];
+        out.extend(self.describe(notebook, &[item])?);
+        let newest = self
+            .reminder_notes
+            .get(&item.id)
+            .and_then(|note| self.index.superseded_by(*note));
+        if let Some(newest) = newest {
+            out.push(String::new());
+            out.push("A later note corrects this one; check it before you act:".to_owned());
+            out.push(self.index.shown(&notebook.note(newest)?));
+        }
+        out.push(String::new());
+        out.push(format!(
+            "It comes only this once. {closing}, note it with {note_tool}."
+        ));
+        Ok(out.join("\n"))
     }
 
     /// Whether `item` has neither fired nor gone stale.
